@@ -5,7 +5,7 @@ import copy
 from pathlib import Path
 from datetime import date
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
 """
 Bid Manager with PDF export
@@ -259,13 +259,15 @@ JOB_FIELDS = [
     ("Fab Due Date", "fab_due_date", "date"),
     ("Building Type", "building_type", "text"),
     ("Wage Data", "wage_data", "text"),
-    ("Estimator", "estimator", "text"),
+    ("Estimator", "estimator", "config:estimators"),
+    ("Project Status", "project_status", "text"),
     ("Tax Exemption", "tax_exemption", "bool"),
-    ("Project Manager", "project_manager", "text"),
+    ("Project Manager", "project_manager", "config:project_managers"),
+    ("Foreman", "foreman", "config:foremen"),
     ("Contract Type", "contract_type", "text"),
     ("Engineer", "engineer", "text"),
     ("Frame / Sealant Color(s)", "frame_colors", "text"),
-    ("General Contractor", "general_contractor", "text"),
+    ("General Contractor", "general_contractors", "config:general_contractors"),
     ("Field / Shop Hours Bid", "field_shop_hours", "text"),
     ("Construction Manager", "construction_manager", "text"),
     ("Frame Information", "frame_information", "text"),
@@ -306,6 +308,14 @@ def default_materials_template():
 def default_materials():
     return copy.deepcopy(default_materials_template())
 
+def default_config():
+    return {
+        "project_managers": [],
+        "foremen": [],
+        "estimators": [],
+        "general_contractors": [],
+    }
+
 def default_schedule_section(spec_id: str):
     return {
         "id": str(uuid.uuid4()),
@@ -322,8 +332,10 @@ def ensure_job_defaults(job: dict) -> None:
             job[key] = False if t == "bool" else ""
     job.setdefault("cost_codes", [])
     job.setdefault("quotes", {})
+    job.setdefault("bid_sheet", {})
     job.setdefault("frame_schedules", {})
     job.setdefault("frame_schedule_rollups", {})
+    job.setdefault("config", default_config())
 
     for cc in job["cost_codes"]:
         cc.setdefault("id", str(uuid.uuid4()))
@@ -332,6 +344,7 @@ def ensure_job_defaults(job: dict) -> None:
         cc.setdefault("alts", [])
 
     normalize_quotes(job)
+    normalize_bid_sheet(job)
     normalize_frame_schedules(job)
 
 
@@ -368,6 +381,80 @@ def normalize_quotes(job: dict) -> None:
     for code in list(job["quotes"].keys()):
         if code not in codes_present:
             del job["quotes"][code]
+
+
+# ======================================================
+# Bid sheet normalization
+# ======================================================
+
+def normalize_bid_sheet(job: dict) -> None:
+    job.setdefault("bid_sheet", {})
+    valid_specs = build_valid_frame_spec_ids(job)
+    for spec_id in valid_specs:
+        row = job["bid_sheet"].setdefault(spec_id, {})
+        row.setdefault("markup_pct", "")
+        row.setdefault("markup_amt", "")
+        row.setdefault("notes", "")
+        row.setdefault("color", "None")
+    for spec_id in list(job["bid_sheet"].keys()):
+        if spec_id not in valid_specs:
+            del job["bid_sheet"][spec_id]
+
+def bid_sheet_direct_cost(job: dict, code: str, variant: str) -> int:
+    quotes_list = job.get("quotes", {}).get(code, {}).get(variant, [])
+    return sum(
+        safe_int(q.get("cost", 0) or 0)
+        for q in quotes_list
+        if safe_int(q.get("cost", 0) or 0) > 0
+    )
+
+def bid_sheet_install_material_total(job: dict, spec_id: str) -> int:
+    rollup = job.get("frame_schedule_rollups", {}).get(spec_id, {})
+    return safe_int(rollup.get("install_material_total", 0))
+
+def bid_sheet_material_breakdown(job: dict, spec_id: str):
+    totals = {}
+    for section in job.get("frame_schedules", {}).get(spec_id, []) or []:
+        if not isinstance(section, dict):
+            continue
+        recompute_section_totals(section)
+        rows = section.get("rows", []) or []
+        subs = schedule_subtotals(rows)
+        basis_subs = {
+            "perim": safe_int(subs.get("perim", 0)),
+            "caulk_lf": safe_int(subs.get("caulk_lf", 0)),
+            "head_sill": safe_int(subs.get("head_sill", 0)),
+        }
+        for m in section.get("materials", []) or []:
+            if not isinstance(m, dict):
+                continue
+            label = (m.get("label") or "").strip() or "Install Material"
+            qty_val = material_qty_for_row(m, basis_subs)
+            rate_val = safe_float(m.get("rate", ""))
+            cost_val = roundup(qty_val * rate_val) if qty_val * rate_val != 0 else 0
+            totals[label] = totals.get(label, 0) + cost_val
+    return sorted(totals.items(), key=lambda x: x[0].lower())
+
+def compute_bid_sheet_total(job: dict) -> int:
+    normalize_quotes(job)
+    normalize_bid_sheet(job)
+    normalize_frame_schedules(job)
+    compute_frame_schedule_rollups(job)
+    total = 0
+    for spec_id, data in job.get("bid_sheet", {}).items():
+        base, variant = parse_frame_spec_id(spec_id)
+        base_cost = bid_sheet_direct_cost(job, base, variant)
+        install_total = bid_sheet_install_material_total(job, spec_id)
+        cost_value = base_cost + install_total
+        pct_val = parse_pct(data.get("markup_pct", ""))
+        amt_val = parse_money(data.get("markup_amt", ""))
+        if amt_val > 0:
+            total += cost_value + amt_val
+        elif pct_val > 0:
+            total += cost_value + roundup(cost_value * (pct_val / 100.0))
+        else:
+            total += cost_value
+    return total
 
 
 # ======================================================
@@ -565,12 +652,16 @@ def compute_frame_schedule_rollups(job: dict) -> None:
 # Job window
 # ======================================================
 
-def open_job_window(root, job: dict, refresh_main):
+def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_manager):
     ensure_job_defaults(job)
+    job["config"] = copy.deepcopy(config_manager["get_all"]())
 
-    win = tk.Toplevel(root)
-    win.title(job.get("job_name") or "Job")
-    win.geometry("1600x900")
+    tab_frame = ttk.Frame(notebook)
+    tab_title = job.get("job_name") or "Job"
+    notebook.add(tab_frame, text=tab_title)
+    notebook.select(tab_frame)
+
+    win = root
 
     # ---------------- UNDO ----------------
     undo_stack = []
@@ -597,16 +688,15 @@ def open_job_window(root, job: dict, refresh_main):
         refresh_job_info_widgets_from_job()
         refresh_cc_tree()
         refresh_quotes_ui(full=True)
-        fs_refresh_spec_options()
-        fs_manager.reconcile_all()
+        maybe_refresh_frame_ui()
 
-    win.bind_all("<Control-z>", undo)
+    tab_frame._undo = undo
 
-    topbar = ttk.Frame(win)
+    topbar = ttk.Frame(tab_frame)
     topbar.pack(fill="x", padx=8, pady=6)
     ttk.Button(topbar, text="Undo (Ctrl+Z)", command=undo).pack(side="left")
 
-    nb = ttk.Notebook(win)
+    nb = ttk.Notebook(tab_frame)
     nb.pack(fill="both", expand=True)
 
     # --------------------------------------------------
@@ -619,6 +709,48 @@ def open_job_window(root, job: dict, refresh_main):
     info_scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
     info_widgets = {}
+    config_widgets = []
+
+    def refresh_config_widgets():
+        for key, widget in config_widgets:
+            values = config_manager["get_values"](key)
+            widget.configure(values=values)
+            if not hasattr(widget, "_all_values"):
+                widget._all_values = list(values)
+            else:
+                widget._all_values = list(values)
+
+    def filter_config_values(widget, key):
+        current = (widget.get() or "").strip().lower()
+        values = config_manager["get_values"](key)
+        if not current:
+            widget.configure(values=values)
+            return
+        filtered = [v for v in values if current in v.lower()]
+        widget.configure(values=filtered if filtered else values)
+
+    def ensure_config_value(widget, key):
+        value = (widget.get() or "").strip()
+        if not value:
+            return True
+        values = config_manager["get_values"](key)
+        if value in values:
+            return True
+        confirm = messagebox.askyesno(
+            "Add New Value",
+            f"'{value}' is not in the configured list.\n\nAdd it to settings?",
+        )
+        if confirm:
+            config_manager["add_value"](key, value)
+            widget.set(value)
+            return True
+        widget.set("")
+        widget.focus_set()
+        return False
+
+    unregister_config = config_manager["register_listener"](refresh_config_widgets)
+    tab_frame._config_unregister = unregister_config
+    refresh_config_widgets()
     for i, (label, key, ftype) in enumerate(JOB_FIELDS):
         row = i // 2
         col = (i % 2) * 2
@@ -634,6 +766,22 @@ def open_job_window(root, job: dict, refresh_main):
             w = make_date_widget(info_scroll.inner, job.get(key, ""))
             w.grid(row=row, column=col + 1, sticky="w", padx=10, pady=6)
             info_widgets[key] = ("date", w)
+        elif ftype.startswith("config:"):
+            config_key = ftype.split("config:", 1)[1]
+            combo = ttk.Combobox(info_scroll.inner, width=50, values=config_manager["get_values"](config_key))
+            combo.set(job.get(key, "") or "")
+            combo.grid(row=row, column=col + 1, sticky="w", padx=10, pady=6)
+            info_widgets[key] = ("config", combo, config_key)
+            config_widgets.append((config_key, combo))
+            combo._all_values = list(config_manager["get_values"](config_key))
+
+            def on_focus_out(_e, w=combo, k=config_key):
+                ensure_config_value(w, k)
+
+            combo.bind("<FocusOut>", on_focus_out)
+            combo.bind("<Return>", on_focus_out)
+            combo.bind("<KeyRelease>", lambda e, w=combo, k=config_key: filter_config_values(w, k))
+            combo.bind("<FocusIn>", lambda e: push_undo())
         else:
             e = ttk.Entry(info_scroll.inner, width=52)
             e.insert(0, job.get(key, "") or "")
@@ -704,6 +852,9 @@ def open_job_window(root, job: dict, refresh_main):
                 w.set(bool(job.get(key, False)))
             elif t == "date":
                 set_date_value(w, job.get(key, "") or "")
+            elif t == "config":
+                _type, combo, _config_key = info_widgets[key]
+                combo.set(job.get(key, "") or "")
             else:
                 w.delete(0, tk.END)
                 w.insert(0, job.get(key, "") or "")
@@ -800,8 +951,7 @@ def open_job_window(root, job: dict, refresh_main):
 
                 refresh_cc_tree()
                 refresh_quotes_ui(full=True)
-                fs_refresh_spec_options()
-                fs_manager.reconcile_all()
+                maybe_refresh_frame_ui()
             except Exception as e:
                 messagebox.showerror("Error", str(e))
             finally:
@@ -829,8 +979,7 @@ def open_job_window(root, job: dict, refresh_main):
         normalize_frame_schedules(job)
         refresh_cc_tree()
         refresh_quotes_ui(full=True)
-        fs_refresh_spec_options()
-        fs_manager.reconcile_all()
+        maybe_refresh_frame_ui()
         cc_tree.selection_set(cc["id"])
         cc_tree.see(cc["id"])
         win.after(50, lambda: begin_inline_edit(cc["id"], "#1"))
@@ -860,8 +1009,7 @@ def open_job_window(root, job: dict, refresh_main):
         normalize_frame_schedules(job)
         refresh_cc_tree()
         refresh_quotes_ui(full=True)
-        fs_refresh_spec_options()
-        fs_manager.reconcile_all()
+        maybe_refresh_frame_ui()
 
     ttk.Button(cc_btns, text="Add Cost Code", command=add_cost_code).pack(side="left")
     ttk.Button(cc_btns, text="Delete Selected", command=delete_selected_cost_code).pack(side="left", padx=8)
@@ -999,6 +1147,31 @@ def open_job_window(root, job: dict, refresh_main):
 
     collapsed_specs = set()
     spec_frames = {}
+    bid_sheet_refresh_after = {"id": None}
+    bid_sheet_dirty = {"value": True}
+    bid_sheet_tab_ref = {"tab": None}
+    bid_sheet_refresh_fn = {"fn": None}
+    quote_ui = {}
+    quotes_initialized = False
+    quotes_dirty = False
+    frame_initialized = False
+    frame_dirty = False
+
+    def is_bid_sheet_active():
+        try:
+            return bid_sheet_tab_ref["tab"] is not None and nb.select() == str(bid_sheet_tab_ref["tab"])
+        except Exception:
+            return False
+
+    def schedule_bid_sheet_refresh(delay_ms: int = 300):
+        bid_sheet_dirty["value"] = True
+        if not is_bid_sheet_active():
+            return
+        if bid_sheet_refresh_fn["fn"] is None:
+            return
+        if bid_sheet_refresh_after["id"] is not None:
+            win.after_cancel(bid_sheet_refresh_after["id"])
+        bid_sheet_refresh_after["id"] = win.after(delay_ms, bid_sheet_refresh_fn["fn"])
 
     def summary_total_avg(quotes_list):
         costs = [safe_int(q.get("cost", 0) or 0) for q in quotes_list if safe_int(q.get("cost", 0) or 0) > 0]
@@ -1024,7 +1197,18 @@ def open_job_window(root, job: dict, refresh_main):
     def add_quote(code: str, variant: str):
         push_undo()
         job["quotes"][code][variant].append({})
-        rebuild_spec_block((code, variant))
+        spec_key = (code, variant)
+        ui = quote_ui.get(spec_key)
+        if ui and ui.get("grid") and ui["grid"].winfo_exists():
+            quotes_list = job["quotes"][code][variant]
+            idx = len(quotes_list) - 1
+            q = quotes_list[idx]
+            ensure_quote_defaults(q)
+            row = create_quote_row(spec_key, ui["grid"], idx, q, code, variant)
+            ui["rows"].append(row)
+            update_quote_totals(spec_key)
+        else:
+            rebuild_spec_block(spec_key)
 
     def delete_quote(code: str, variant: str, idx: int):
         push_undo()
@@ -1034,7 +1218,130 @@ def open_job_window(root, job: dict, refresh_main):
                 job["quotes"][code][variant].append({})
         except Exception:
             pass
-        rebuild_spec_block((code, variant))
+        spec_key = (code, variant)
+        ui = quote_ui.get(spec_key)
+        if ui and ui.get("grid") and ui["grid"].winfo_exists():
+            rows = ui["rows"]
+            if 0 <= idx < len(rows):
+                for w in rows[idx]["widgets"]:
+                    w.destroy()
+                rows.pop(idx)
+                if not rows:
+                    quotes_list = job["quotes"][code][variant]
+                    if quotes_list:
+                        ensure_quote_defaults(quotes_list[0])
+                        rows.append(create_quote_row(spec_key, ui["grid"], 0, quotes_list[0], code, variant))
+                for new_idx, row in enumerate(rows):
+                    row["index"] = new_idx
+                    for widget in row["widgets"]:
+                        grid_info = widget.grid_info()
+                        widget.grid_configure(row=new_idx + 1, column=grid_info.get("column", 0))
+                    row["delete_btn"].configure(command=lambda i=new_idx, c=code, v=variant: delete_quote(c, v, i))
+                update_quote_totals(spec_key)
+            else:
+                rebuild_spec_block(spec_key)
+        else:
+            rebuild_spec_block(spec_key)
+
+    def update_quote_totals(spec_key):
+        code, variant = spec_key
+        ui = quote_ui.get(spec_key)
+        if not ui:
+            return
+        total, avg = summary_total_avg(job["quotes"][code][variant])
+        ui["total_label"].config(text=f"Total {money_fmt(total)} · Avg {money_fmt(avg)}")
+
+    def create_quote_row(spec_key, grid, idx, q, code, variant):
+        row_widgets = []
+
+        date_w = make_date_widget(grid, q["date"])
+        date_w.grid(row=idx + 1, column=0, padx=4, sticky="w")
+        row_widgets.append(date_w)
+
+        vendor_e = ttk.Entry(grid, width=18)
+        vendor_e.insert(0, q["vendor"])
+        vendor_e.grid(row=idx + 1, column=1, padx=4, sticky="w")
+        row_widgets.append(vendor_e)
+
+        price_e = ttk.Entry(grid, width=12)
+        price_e.insert(0, money_fmt(q["price"]))
+        price_e.grid(row=idx + 1, column=2, padx=4, sticky="w")
+        row_widgets.append(price_e)
+
+        sur_e = ttk.Entry(grid, width=10)
+        sur_e.insert(0, pct_fmt(q["surcharge"]))
+        sur_e.grid(row=idx + 1, column=3, padx=4, sticky="w")
+        row_widgets.append(sur_e)
+
+        cost_lbl = ttk.Label(grid, text=money_fmt(q["cost"]))
+        cost_lbl.grid(row=idx + 1, column=4, padx=4, sticky="w")
+        row_widgets.append(cost_lbl)
+
+        notes_e = ttk.Entry(grid, width=30)
+        notes_e.insert(0, q["notes"])
+        notes_e.grid(row=idx + 1, column=5, padx=4, sticky="w")
+        row_widgets.append(notes_e)
+
+        del_btn = ttk.Button(grid, text="−", width=2,
+                             command=lambda i=idx, c=code, v=variant: delete_quote(c, v, i))
+        del_btn.grid(row=idx + 1, column=6, padx=4, sticky="w")
+        row_widgets.append(del_btn)
+
+        def recalc(qref=q, pe=price_e, se=sur_e, cl=cost_lbl, dw=date_w, ve=vendor_e, ne=notes_e):
+            price = parse_money(pe.get())
+            sur = parse_pct(se.get())
+            current_date = get_date_value(dw)
+            if price > 0 and not current_date.strip():
+                set_date_value(dw, today_str())
+                current_date = get_date_value(dw)
+
+            qref["date"] = current_date
+            qref["vendor"] = ve.get().strip()
+            qref["price"] = price
+            qref["surcharge"] = sur
+            qref["cost"] = calc_cost(price, sur)
+            qref["notes"] = ne.get().strip()
+            cl.config(text=money_fmt(qref["cost"]))
+            handle_quote_change(code, variant)
+
+        def mark_undo_once(_e=None):
+            if not hasattr(price_e, "_undo_marked"):
+                price_e._undo_marked = True
+                push_undo()
+
+        for w in (price_e, sur_e, vendor_e, notes_e):
+            w.bind("<FocusIn>", mark_undo_once)
+            w.bind("<KeyRelease>", lambda e, f=recalc: f())
+
+        if HAS_TKCALENDAR and isinstance(date_w, DateEntry):
+            date_w.bind("<<DateEntrySelected>>", lambda e, f=recalc: f())
+        else:
+            date_w.bind("<KeyRelease>", lambda e, f=recalc: f())
+
+        def fmt_price_on_blur(_e=None, w=price_e, f=recalc):
+            v = parse_money(w.get())
+            w.delete(0, tk.END)
+            w.insert(0, money_fmt(v))
+            f()
+            if hasattr(w, "_undo_marked"):
+                delattr(w, "_undo_marked")
+
+        def fmt_sur_on_blur(_e=None, w=sur_e, f=recalc):
+            v = parse_pct(w.get())
+            w.delete(0, tk.END)
+            w.insert(0, pct_fmt(v))
+            f()
+
+        price_e.bind("<FocusOut>", fmt_price_on_blur)
+        sur_e.bind("<FocusOut>", fmt_sur_on_blur)
+
+        recalc()
+
+        return {
+            "index": idx,
+            "widgets": row_widgets,
+            "delete_btn": del_btn,
+        }
 
     def build_spec_block(parent, code: str, desc: str, variant: str):
         spec_key = (code, variant)
@@ -1055,6 +1362,7 @@ def open_job_window(root, job: dict, refresh_main):
             total, avg = summary_total_avg(quotes_list)
             ttk.Label(parent, text=f"Total {money_fmt(total)} · Avg {money_fmt(avg)}", foreground="gray")\
                 .pack(anchor="w", padx=28, pady=(2, 6))
+            quote_ui.pop(spec_key, None)
             return
 
         grid = ttk.Frame(parent)
@@ -1065,87 +1373,20 @@ def open_job_window(root, job: dict, refresh_main):
         for c, h in enumerate(headers):
             ttk.Label(grid, text=h).grid(row=0, column=c, padx=4, sticky="w")
 
+        rows = []
         for idx, q in enumerate(quotes_list):
             ensure_quote_defaults(q)
-
-            date_w = make_date_widget(grid, q["date"])
-            date_w.grid(row=idx + 1, column=0, padx=4, sticky="w")
-
-            vendor_e = ttk.Entry(grid, width=widths[1])
-            vendor_e.insert(0, q["vendor"])
-            vendor_e.grid(row=idx + 1, column=1, padx=4, sticky="w")
-
-            price_e = ttk.Entry(grid, width=widths[2])
-            price_e.insert(0, money_fmt(q["price"]))
-            price_e.grid(row=idx + 1, column=2, padx=4, sticky="w")
-
-            sur_e = ttk.Entry(grid, width=widths[3])
-            sur_e.insert(0, pct_fmt(q["surcharge"]))
-            sur_e.grid(row=idx + 1, column=3, padx=4, sticky="w")
-
-            cost_lbl = ttk.Label(grid, text=money_fmt(q["cost"]))
-            cost_lbl.grid(row=idx + 1, column=4, padx=4, sticky="w")
-
-            notes_e = ttk.Entry(grid, width=widths[5])
-            notes_e.insert(0, q["notes"])
-            notes_e.grid(row=idx + 1, column=5, padx=4, sticky="w")
-
-            ttk.Button(grid, text="−", width=2,
-                       command=lambda i=idx, c=code, v=variant: delete_quote(c, v, i))\
-                .grid(row=idx + 1, column=6, padx=4, sticky="w")
-
-            def recalc(qref=q, pe=price_e, se=sur_e, cl=cost_lbl, dw=date_w, ve=vendor_e, ne=notes_e):
-                price = parse_money(pe.get())
-                sur = parse_pct(se.get())
-                current_date = get_date_value(dw)
-                if price > 0 and not current_date.strip():
-                    set_date_value(dw, today_str())
-                    current_date = get_date_value(dw)
-
-                qref["date"] = current_date
-                qref["vendor"] = ve.get().strip()
-                qref["price"] = price
-                qref["surcharge"] = sur
-                qref["cost"] = calc_cost(price, sur)
-                qref["notes"] = ne.get().strip()
-                cl.config(text=money_fmt(qref["cost"]))
-
-            def mark_undo_once(_e=None):
-                if not hasattr(price_e, "_undo_marked"):
-                    price_e._undo_marked = True
-                    push_undo()
-
-            for w in (price_e, sur_e, vendor_e, notes_e):
-                w.bind("<FocusIn>", mark_undo_once)
-                w.bind("<KeyRelease>", lambda e, f=recalc: f())
-
-            if HAS_TKCALENDAR and isinstance(date_w, DateEntry):
-                date_w.bind("<<DateEntrySelected>>", lambda e, f=recalc: f())
-            else:
-                date_w.bind("<KeyRelease>", lambda e, f=recalc: f())
-
-            def fmt_price_on_blur(_e=None, w=price_e, f=recalc):
-                v = parse_money(w.get())
-                w.delete(0, tk.END)
-                w.insert(0, money_fmt(v))
-                f()
-                if hasattr(w, "_undo_marked"):
-                    delattr(w, "_undo_marked")
-
-            def fmt_sur_on_blur(_e=None, w=sur_e, f=recalc):
-                v = parse_pct(w.get())
-                w.delete(0, tk.END)
-                w.insert(0, pct_fmt(v))
-                f()
-
-            price_e.bind("<FocusOut>", fmt_price_on_blur)
-            sur_e.bind("<FocusOut>", fmt_sur_on_blur)
-
-            recalc()
+            rows.append(create_quote_row(spec_key, grid, idx, q, code, variant))
 
         total, avg = summary_total_avg(quotes_list)
-        ttk.Label(parent, text=f"Total {money_fmt(total)} · Avg {money_fmt(avg)}", foreground="gray")\
-            .pack(anchor="w", padx=28, pady=(0, 2))
+        total_label = ttk.Label(parent, text=f"Total {money_fmt(total)} · Avg {money_fmt(avg)}", foreground="gray")
+        total_label.pack(anchor="w", padx=28, pady=(0, 2))
+
+        quote_ui[spec_key] = {
+            "grid": grid,
+            "rows": rows,
+            "total_label": total_label,
+        }
 
     def rebuild_spec_block(spec_key):
         frame = spec_frames.get(spec_key)
@@ -1162,8 +1403,20 @@ def open_job_window(root, job: dict, refresh_main):
                 break
         build_spec_block(frame, code, desc, variant)
 
-    def refresh_quotes_ui(full=True):
+    def ensure_quotes_initialized():
+        nonlocal quotes_initialized
+        if quotes_initialized:
+            return
+        quotes_initialized = True
+        refresh_quotes_ui(full=True, force=True)
+
+    def refresh_quotes_ui(full=True, force=False):
+        nonlocal quotes_dirty
+        if not quotes_initialized and not force:
+            quotes_dirty = True
+            return
         normalize_quotes(job)
+        normalize_bid_sheet(job)
         if full:
             for w in quotes_scroll.inner.winfo_children():
                 w.destroy()
@@ -1185,6 +1438,387 @@ def open_job_window(root, job: dict, refresh_main):
                 frame.pack(fill="x", anchor="w")
                 spec_frames[spec_key] = frame
                 build_spec_block(frame, code, desc, variant)
+        bid_sheet_dirty["value"] = True
+        quotes_dirty = False
+        if is_bid_sheet_active():
+            schedule_bid_sheet_refresh()
+
+    # --------------------------------------------------
+    # Tab: Bid Sheet
+    # --------------------------------------------------
+    tab_bs = ttk.Frame(nb)
+    nb.add(tab_bs, text="Bid Sheet")
+
+    bs_scroll = ScrollFrame(tab_bs)
+    bs_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+
+    bs_topbar = ttk.Frame(bs_scroll.inner)
+    bs_topbar.pack(fill="x", pady=(0, 6))
+    ttk.Label(
+        bs_topbar,
+        text="Bid Sheet (subtotal > line items > install material breakdown). Double-click markup/notes to edit."
+    ).pack(side="left")
+
+    bs_tree = ttk.Treeview(
+        bs_scroll.inner,
+        columns=("desc", "cost", "markup_pct", "markup_amt", "sov", "notes", "color"),
+        show="tree headings",
+        height=18,
+    )
+    bs_tree.pack(fill="both", expand=True)
+
+    bs_tree.heading("#0", text="CODE")
+    bs_tree.heading("desc", text="DESCRIPTION (TYPE)")
+    bs_tree.heading("cost", text="COST")
+    bs_tree.heading("markup_pct", text="MARKUP %")
+    bs_tree.heading("markup_amt", text="MARKUP $")
+    bs_tree.heading("sov", text="SOV")
+    bs_tree.heading("notes", text="NOTES")
+    bs_tree.heading("color", text="COLOR")
+
+    bs_tree.column("#0", width=140, anchor="w")
+    bs_tree.column("desc", width=320, anchor="w")
+    bs_tree.column("cost", width=110, anchor="e")
+    bs_tree.column("markup_pct", width=90, anchor="e")
+    bs_tree.column("markup_amt", width=100, anchor="e")
+    bs_tree.column("sov", width=110, anchor="e")
+    bs_tree.column("notes", width=220, anchor="w")
+    bs_tree.column("color", width=90, anchor="center")
+
+    COLOR_OPTIONS = ["None", "Yellow", "Green", "Red", "Blue", "Gray"]
+    COLOR_MAP = {
+        "None": "",
+        "Yellow": "#fff3a0",
+        "Green": "#c8f7c5",
+        "Red": "#f7c5c5",
+        "Blue": "#c5d9f7",
+        "Gray": "#e0e0e0",
+    }
+
+    bid_sheet_item_meta = {}
+    bid_sheet_line_index = {}
+    bs_sort_state = {"col": None, "descending": False}
+    bs_edit_widget = {"widget": None}
+
+    def _clear_bs_tree():
+        for item in bs_tree.get_children():
+            bs_tree.delete(item)
+        bid_sheet_item_meta.clear()
+        bid_sheet_line_index.clear()
+
+    def _apply_color_tag(item_id: str, color_name: str):
+        color = COLOR_MAP.get(color_name or "None", "")
+        if color:
+            tag = f"color_{color_name}"
+            if not bs_tree.tag_has(tag):
+                bs_tree.tag_configure(tag, background=color)
+            bs_tree.item(item_id, tags=(tag,))
+        else:
+            bs_tree.item(item_id, tags=())
+
+    def _calc_markup_values(cost_value: int, markup_pct_text: str, markup_amt_text: str):
+        pct_val = parse_pct(markup_pct_text)
+        amt_val = parse_money(markup_amt_text)
+        if amt_val > 0:
+            pct_val = (amt_val / cost_value * 100.0) if cost_value else 0.0
+        elif pct_val > 0:
+            amt_val = roundup(cost_value * (pct_val / 100.0))
+        else:
+            pct_val = 0.0
+            amt_val = 0
+        return pct_val, amt_val
+
+    def _format_markup_values(pct_val: float, amt_val: int):
+        pct_display = pct_fmt(pct_val) if pct_val else ""
+        amt_display = money_fmt(amt_val) if amt_val else ""
+        return pct_display, amt_display
+
+    def _update_parent_totals(parent_id: str):
+        if not parent_id:
+            return
+        total_sov = 0
+        total_cost = 0
+        for child in bs_tree.get_children(parent_id):
+            values = bs_tree.item(child, "values")
+            total_cost += parse_money(values[1])
+            total_sov += parse_money(values[4])
+        values = list(bs_tree.item(parent_id, "values"))
+        if len(values) >= 5:
+            values[1] = money_fmt(total_cost)
+            values[4] = money_fmt(total_sov)
+            bs_tree.item(parent_id, values=values)
+
+    def _sort_children(parent_id: str, col: str, descending: bool):
+        children = list(bs_tree.get_children(parent_id))
+        def sort_key(item_id):
+            if col == "#0":
+                return (bs_tree.item(item_id, "text") or "").lower()
+            values = bs_tree.item(item_id, "values")
+            idx_map = {
+                "desc": 0,
+                "cost": 1,
+                "markup_pct": 2,
+                "markup_amt": 3,
+                "sov": 4,
+                "notes": 5,
+                "color": 6,
+            }
+            idx = idx_map.get(col, 0)
+            val = values[idx] if idx < len(values) else ""
+            if col in ("cost", "markup_amt", "sov"):
+                return parse_money(val)
+            if col == "markup_pct":
+                return parse_pct(val)
+            return str(val).lower()
+
+        children.sort(key=sort_key, reverse=descending)
+        for idx, item_id in enumerate(children):
+            bs_tree.move(item_id, parent_id, idx)
+            _sort_children(item_id, col, descending)
+
+    def _sort_by(col: str):
+        descending = bs_sort_state["descending"] if bs_sort_state["col"] == col else False
+        bs_sort_state["col"] = col
+        bs_sort_state["descending"] = not descending
+        _sort_children("", col, not descending)
+
+    for col_id in ("#0", "desc", "cost", "markup_pct", "markup_amt", "sov", "notes", "color"):
+        bs_tree.heading(col_id, command=lambda c=col_id: _sort_by(c))
+
+    def _start_edit(item_id: str, column: str):
+        if item_id not in bid_sheet_item_meta:
+            return
+        meta = bid_sheet_item_meta[item_id]
+        if meta.get("row_type") != "line_item":
+            return
+        if column not in ("markup_pct", "markup_amt", "notes", "color"):
+            return
+
+        if bs_edit_widget["widget"]:
+            bs_edit_widget["widget"].destroy()
+            bs_edit_widget["widget"] = None
+
+        bbox = bs_tree.bbox(item_id, column)
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        parent = bs_tree
+
+        if column == "color":
+            widget = ttk.Combobox(parent, values=COLOR_OPTIONS, state="readonly")
+            widget.place(x=x, y=y, width=w, height=h)
+            widget.set(meta["data"].get("color", "None"))
+        else:
+            widget = ttk.Entry(parent)
+            widget.place(x=x, y=y, width=w, height=h)
+            widget.insert(0, bs_tree.set(item_id, column))
+
+        bs_edit_widget["widget"] = widget
+        widget.focus_set()
+
+        def commit(_event=None):
+            if not widget.winfo_exists():
+                return
+            new_val = widget.get().strip()
+            if column == "color":
+                meta["data"]["color"] = new_val if new_val in COLOR_OPTIONS else "None"
+                bs_tree.set(item_id, "color", meta["data"]["color"])
+                _apply_color_tag(item_id, meta["data"]["color"])
+            elif column == "notes":
+                meta["data"]["notes"] = new_val
+                bs_tree.set(item_id, "notes", new_val)
+            elif column == "markup_pct":
+                meta["data"]["markup_pct"] = new_val
+            elif column == "markup_amt":
+                meta["data"]["markup_amt"] = new_val
+
+            if column in ("markup_pct", "markup_amt"):
+                cost_value = meta["cost_value"]
+                pct_val, amt_val = _calc_markup_values(cost_value, meta["data"].get("markup_pct", ""), meta["data"].get("markup_amt", ""))
+                pct_display, amt_display = _format_markup_values(pct_val, amt_val)
+                meta["data"]["markup_pct"] = pct_display
+                meta["data"]["markup_amt"] = amt_display
+                bs_tree.set(item_id, "markup_pct", pct_display)
+                bs_tree.set(item_id, "markup_amt", amt_display)
+                bs_tree.set(item_id, "sov", money_fmt(cost_value + amt_val))
+                _update_parent_totals(meta["parent_id"])
+
+            widget.destroy()
+            bs_edit_widget["widget"] = None
+
+        widget.bind("<Return>", commit)
+        widget.bind("<FocusOut>", commit)
+
+    def _on_double_click(event):
+        item_id = bs_tree.identify_row(event.y)
+        column = bs_tree.identify_column(event.x)
+        if not item_id:
+            return
+        col_map = {
+            "#2": "desc",
+            "#3": "cost",
+            "#4": "markup_pct",
+            "#5": "markup_amt",
+            "#6": "sov",
+            "#7": "notes",
+            "#8": "color",
+        }
+        col_id = col_map.get(column)
+        if col_id:
+            _start_edit(item_id, col_id)
+
+    bs_tree.bind("<Double-Button-1>", _on_double_click)
+
+    bid_sheet_tab_ref["tab"] = tab_bs
+
+    def _on_tab_changed(_event=None):
+        selected = nb.select()
+        if selected == str(tab_q):
+            ensure_quotes_initialized()
+            if quotes_dirty:
+                refresh_quotes_ui(full=True, force=True)
+        if selected == str(tab_fs):
+            ensure_frame_initialized()
+            if frame_dirty:
+                maybe_refresh_frame_ui()
+        if is_bid_sheet_active() and bid_sheet_dirty["value"]:
+            schedule_bid_sheet_refresh()
+
+    nb.bind("<<NotebookTabChanged>>", _on_tab_changed)
+
+    def refresh_bid_sheet_ui():
+        normalize_quotes(job)
+        normalize_bid_sheet(job)
+        normalize_frame_schedules(job)
+        compute_frame_schedule_rollups(job)
+        _clear_bs_tree()
+
+        for cc in sorted(job["cost_codes"], key=lambda x: (x.get("code") or "")):
+            code = (cc.get("code") or "").strip()
+            if not code:
+                continue
+            desc = cc.get("description", "")
+            subtotal_id = bs_tree.insert(
+                "",
+                "end",
+                text=code,
+                values=("Subtotal", "$0", "", "", "$0", "", ""),
+                open=True,
+            )
+
+            subtotal_cost = 0
+            subtotal_sov = 0
+
+            for variant in variants_for_cc(cc.get("alts", [])):
+                spec_id = frame_spec_id(code, variant)
+                data = job["bid_sheet"].setdefault(spec_id, {})
+                base_cost = bid_sheet_direct_cost(job, code, variant)
+                install_total = bid_sheet_install_material_total(job, spec_id)
+                cost_value = base_cost + install_total
+
+                pct_val, amt_val = _calc_markup_values(cost_value, data.get("markup_pct", ""), data.get("markup_amt", ""))
+                pct_display, amt_display = _format_markup_values(pct_val, amt_val)
+                data["markup_pct"] = pct_display
+                data["markup_amt"] = amt_display
+
+                desc_type = f"{desc} ({variant})"
+                line_id = bs_tree.insert(
+                    subtotal_id,
+                    "end",
+                    text=code,
+                    values=(
+                        desc_type,
+                        money_fmt(cost_value),
+                        pct_display,
+                        amt_display,
+                        money_fmt(cost_value + amt_val),
+                        data.get("notes", ""),
+                        data.get("color", "None"),
+                    ),
+                    open=True,
+                )
+                bid_sheet_item_meta[line_id] = {
+                    "row_type": "line_item",
+                    "spec_id": spec_id,
+                    "data": data,
+                    "cost_value": cost_value,
+                    "parent_id": subtotal_id,
+                }
+                bid_sheet_line_index[spec_id] = line_id
+                _apply_color_tag(line_id, data.get("color", "None"))
+
+                base_id = bs_tree.insert(
+                    line_id,
+                    "end",
+                    text="",
+                    values=("Base Product", money_fmt(base_cost), "", "", money_fmt(base_cost), "", ""),
+                )
+                install_id = bs_tree.insert(
+                    line_id,
+                    "end",
+                    text="",
+                    values=("Install Material", money_fmt(install_total), "", "", money_fmt(install_total), "", ""),
+                    open=False,
+                )
+                bid_sheet_item_meta[line_id]["base_id"] = base_id
+                bid_sheet_item_meta[line_id]["install_id"] = install_id
+
+                for label, cost in bid_sheet_material_breakdown(job, spec_id):
+                    bs_tree.insert(
+                        install_id,
+                        "end",
+                        text="",
+                        values=(label, money_fmt(cost), "", "", money_fmt(cost), "", ""),
+                    )
+
+                subtotal_cost += cost_value
+                subtotal_sov += cost_value + amt_val
+
+            bs_tree.item(
+                subtotal_id,
+                values=("Subtotal", money_fmt(subtotal_cost), "", "", money_fmt(subtotal_sov), "", ""),
+            )
+        bid_sheet_dirty["value"] = False
+
+    bid_sheet_refresh_fn["fn"] = refresh_bid_sheet_ui
+
+    def update_bid_sheet_line_item(spec_id: str):
+        line_id = bid_sheet_line_index.get(spec_id)
+        if not line_id:
+            return
+        meta = bid_sheet_item_meta.get(line_id, {})
+        data = meta.get("data", {})
+        base, variant = parse_frame_spec_id(spec_id)
+        base_cost = bid_sheet_direct_cost(job, base, variant)
+        install_total = bid_sheet_install_material_total(job, spec_id)
+        cost_value = base_cost + install_total
+        pct_val, amt_val = _calc_markup_values(cost_value, data.get("markup_pct", ""), data.get("markup_amt", ""))
+        pct_display, amt_display = _format_markup_values(pct_val, amt_val)
+        data["markup_pct"] = pct_display
+        data["markup_amt"] = amt_display
+        bs_tree.set(line_id, "cost", money_fmt(cost_value))
+        bs_tree.set(line_id, "markup_pct", pct_display)
+        bs_tree.set(line_id, "markup_amt", amt_display)
+        bs_tree.set(line_id, "sov", money_fmt(cost_value + amt_val))
+        base_id = meta.get("base_id")
+        if base_id:
+            bs_tree.item(base_id, values=("Base Product", money_fmt(base_cost), "", "", money_fmt(base_cost), "", ""))
+        install_id = meta.get("install_id")
+        if install_id:
+            bs_tree.item(install_id, values=("Install Material", money_fmt(install_total), "", "", money_fmt(install_total), "", ""))
+        _update_parent_totals(meta.get("parent_id"))
+
+    def handle_quote_change(code: str, variant: str):
+        spec_id = frame_spec_id(code, variant)
+        bid_sheet_dirty["value"] = True
+        if not is_bid_sheet_active():
+            return
+        if bid_sheet_refresh_fn["fn"] is None:
+            return
+        if spec_id in bid_sheet_line_index:
+            update_bid_sheet_line_item(spec_id)
+            return
+        schedule_bid_sheet_refresh()
 
     # --------------------------------------------------
     # Tab: Frame Schedule  (FIXED: add section never tears down existing UIs)
@@ -1822,6 +2456,24 @@ def open_job_window(root, job: dict, refresh_main):
 
     fs_manager = FrameScheduleManager()
 
+    def ensure_frame_initialized():
+        nonlocal frame_initialized, frame_dirty
+        if frame_initialized:
+            return
+        frame_initialized = True
+        fs_refresh_spec_options()
+        fs_manager.reconcile_all()
+        frame_dirty = False
+
+    def maybe_refresh_frame_ui():
+        nonlocal frame_dirty
+        if not frame_initialized:
+            frame_dirty = True
+            return
+        fs_refresh_spec_options()
+        fs_manager.reconcile_all()
+        frame_dirty = False
+
     def fs_add_schedule_section():
         # FIX: do NOT call reconcile-all/normalize in a way that churns widgets while
         # existing entries are mid-edit. Add the UI directly.
@@ -1981,17 +2633,27 @@ def open_job_window(root, job: dict, refresh_main):
                 job[key] = bool(w.get())
             elif t == "date":
                 job[key] = get_date_value(w)
+            elif t == "config":
+                _type, combo, _config_key = info_widgets[key]
+                if not ensure_config_value(combo, _config_key):
+                    job[key] = ""
+                else:
+                    job[key] = (combo.get() or "").strip()
             else:
                 job[key] = (w.get() or "").strip()
 
     def save_only():
         collect_job_info_into_job()
         normalize_quotes(job)
+        normalize_bid_sheet(job)
         normalize_frame_schedules(job)
         compute_frame_schedule_rollups(job)
         if not (job.get("job_name") or "").strip():
             return
+        job["bid_sheet_total"] = compute_bid_sheet_total(job)
+        job["config"] = copy.deepcopy(config_manager["get_all"]())
         save_job(job)
+        notebook.tab(tab_frame, text=job.get("job_name") or "Job")
         refresh_main()
 
     def save_and_close():
@@ -2000,11 +2662,15 @@ def open_job_window(root, job: dict, refresh_main):
             messagebox.showerror("Error", "Job Name is required.")
             return
         normalize_quotes(job)
+        normalize_bid_sheet(job)
         normalize_frame_schedules(job)
         compute_frame_schedule_rollups(job)
+        job["bid_sheet_total"] = compute_bid_sheet_total(job)
+        job["config"] = copy.deepcopy(config_manager["get_all"]())
         save_job(job)
+        notebook.tab(tab_frame, text=job.get("job_name") or "Job")
         refresh_main()
-        win.destroy()
+        close_tab(tab_frame)
 
     ttk.Button(topbar, text="Save & Close", command=save_and_close).pack(side="right")
 
@@ -2023,9 +2689,8 @@ def open_job_window(root, job: dict, refresh_main):
     # Initial renders
     # --------------------------------------------------
     refresh_cc_tree()
-    refresh_quotes_ui(full=True)
-    fs_refresh_spec_options()
-    fs_manager.reconcile_all()
+
+    return tab_frame
 
 
 # ======================================================
@@ -2036,35 +2701,240 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Bid Manager")
-        root.geometry("520x520")
+        root.geometry("1200x800")
 
-        frm = ttk.Frame(root, padding=10)
+        self.config = self._load_config()
+        self.config_listeners = []
+
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True)
+
+        self.home_tab = ttk.Frame(self.nb)
+        self.nb.add(self.home_tab, text="Home")
+        self.settings_tab = ttk.Frame(self.nb)
+        self.nb.add(self.settings_tab, text="Settings")
+
+        frm = ttk.Frame(self.home_tab, padding=10)
         frm.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="New Job Name").pack(anchor="w")
-        self.new_job = ttk.Entry(frm)
+        home_top = ttk.Frame(frm)
+        home_top.pack(fill="x")
+        ttk.Label(home_top, text="New Job Name").pack(anchor="w")
+        self.new_job = ttk.Entry(home_top)
         self.new_job.pack(fill="x")
 
-        ttk.Button(frm, text="Create Job", command=self.create_job).pack(pady=6)
+        home_actions = ttk.Frame(frm)
+        home_actions.pack(fill="x", pady=6)
+        ttk.Button(home_actions, text="Create Job", command=self.create_job).pack(side="left")
+        ttk.Button(home_actions, text="Open Settings", command=lambda: self.nb.select(self.settings_tab)).pack(side="right")
 
         ttk.Label(frm, text="Jobs (double-click to open):").pack(anchor="w", pady=(10, 0))
         self.listbox = tk.Listbox(frm)
         self.listbox.pack(fill="both", expand=True, pady=10)
         self.listbox.bind("<Double-Button-1>", self.open_selected)
 
+        ttk.Label(frm, text="Project Summary").pack(anchor="w", pady=(10, 0))
+        self.summary_tree = ttk.Treeview(
+            frm,
+            columns=("job_name", "estimator", "pm", "status", "bid_total"),
+            show="headings",
+            height=8,
+        )
+        self.summary_tree.heading("job_name", text="Job Name")
+        self.summary_tree.heading("estimator", text="Estimator")
+        self.summary_tree.heading("pm", text="Project Manager")
+        self.summary_tree.heading("status", text="Status")
+        self.summary_tree.heading("bid_total", text="Bid Sheet Total")
+        self.summary_tree.column("job_name", width=200, anchor="w")
+        self.summary_tree.column("estimator", width=160, anchor="w")
+        self.summary_tree.column("pm", width=180, anchor="w")
+        self.summary_tree.column("status", width=140, anchor="w")
+        self.summary_tree.column("bid_total", width=140, anchor="e")
+        self.summary_tree.pack(fill="x", pady=(4, 10))
+
+        self.job_tabs = {}
+        self.root.bind("<Control-z>", self._handle_undo)
+
+        self._build_settings_page()
         self.refresh()
+
+    def _load_config(self):
+        jobs = load_jobs()
+        if not jobs:
+            return default_config()
+        cfg = jobs[0].get("config", default_config())
+        return {
+            "project_managers": sorted(set(cfg.get("project_managers", []))),
+            "foremen": sorted(set(cfg.get("foremen", []))),
+            "estimators": sorted(set(cfg.get("estimators", []))),
+            "general_contractors": sorted(set(cfg.get("general_contractors", []))),
+        }
+
+    def _persist_config(self):
+        jobs = load_jobs()
+        for job in jobs:
+            job["config"] = copy.deepcopy(self.config)
+            save_job(job)
+
+    def _notify_config_listeners(self):
+        for callback in list(self.config_listeners):
+            try:
+                callback()
+            except Exception:
+                pass
+
+    def register_config_listener(self, callback):
+        self.config_listeners.append(callback)
+        def unregister():
+            if callback in self.config_listeners:
+                self.config_listeners.remove(callback)
+        return unregister
+
+    def get_config_values(self, key):
+        return list(self.config.get(key, []))
+
+    def get_config(self):
+        return copy.deepcopy(self.config)
+
+    def add_config_value(self, key, value):
+        value = (value or "").strip()
+        if not value:
+            return
+        values = self.config.setdefault(key, [])
+        if value in values:
+            return
+        values.append(value)
+        values.sort()
+        self._persist_config()
+        self._notify_config_listeners()
+        self._refresh_settings_lists()
+
+    def update_config_value(self, key, old_value, new_value):
+        old_value = (old_value or "").strip()
+        new_value = (new_value or "").strip()
+        if not old_value or not new_value or old_value == new_value:
+            return
+        values = self.config.setdefault(key, [])
+        if old_value in values:
+            values.remove(old_value)
+        if new_value not in values:
+            values.append(new_value)
+        values.sort()
+        self._persist_config()
+        self._notify_config_listeners()
+        self._refresh_settings_lists()
+
+    def delete_config_value(self, key, value):
+        value = (value or "").strip()
+        if not value:
+            return
+        values = self.config.setdefault(key, [])
+        if value in values:
+            values.remove(value)
+        self._persist_config()
+        self._notify_config_listeners()
+        self._refresh_settings_lists()
+
+    def _build_settings_page(self):
+        wrapper = ttk.Frame(self.settings_tab, padding=10)
+        wrapper.pack(fill="both", expand=True)
+        ttk.Label(wrapper, text="Settings").pack(anchor="w")
+
+        self.settings_lists = {}
+
+        def build_list_section(parent, title, key):
+            section = ttk.LabelFrame(parent, text=title, padding=8)
+            section.pack(fill="x", pady=6)
+            listbox = tk.Listbox(section, height=5)
+            listbox.pack(side="left", fill="x", expand=True)
+            buttons = ttk.Frame(section)
+            buttons.pack(side="right", padx=6)
+            ttk.Button(
+                buttons,
+                text="Add",
+                command=lambda: self._settings_add_value(key),
+            ).pack(fill="x", pady=(0, 4))
+            ttk.Button(
+                buttons,
+                text="Edit",
+                command=lambda: self._settings_edit_value(key),
+            ).pack(fill="x", pady=(0, 4))
+            ttk.Button(
+                buttons,
+                text="Delete",
+                command=lambda: self._settings_delete_value(key),
+            ).pack(fill="x")
+            self.settings_lists[key] = listbox
+
+        build_list_section(wrapper, "Project Managers", "project_managers")
+        build_list_section(wrapper, "Foremen", "foremen")
+        build_list_section(wrapper, "Estimators", "estimators")
+        build_list_section(wrapper, "General Contractors", "general_contractors")
+        self._refresh_settings_lists()
+
+    def _refresh_settings_lists(self):
+        if not hasattr(self, "settings_lists"):
+            return
+        for key, listbox in self.settings_lists.items():
+            listbox.delete(0, tk.END)
+            for value in self.get_config_values(key):
+                listbox.insert(tk.END, value)
+
+    def _settings_add_value(self, key):
+        value = simpledialog.askstring("Add Value", "Enter a new value:")
+        if value:
+            self.add_config_value(key, value)
+
+    def _settings_edit_value(self, key):
+        listbox = self.settings_lists.get(key)
+        if not listbox:
+            return
+        sel = listbox.curselection()
+        if not sel:
+            return
+        old_value = listbox.get(sel[0])
+        new_value = simpledialog.askstring("Edit Value", "Update value:", initialvalue=old_value)
+        if new_value:
+            self.update_config_value(key, old_value, new_value)
+
+    def _settings_delete_value(self, key):
+        listbox = self.settings_lists.get(key)
+        if not listbox:
+            return
+        sel = listbox.curselection()
+        if not sel:
+            return
+        value = listbox.get(sel[0])
+        if messagebox.askyesno("Delete Value", f"Remove '{value}' from {key.replace('_', ' ')}?"):
+            self.delete_config_value(key, value)
 
     def refresh(self):
         self.jobs = load_jobs()
         self.listbox.delete(0, tk.END)
         for j in self.jobs:
             self.listbox.insert(tk.END, (j.get("job_name") or "").strip())
+        self._refresh_summary()
+
+    def _refresh_summary(self):
+        self.summary_tree.delete(*self.summary_tree.get_children())
+        for job in self.jobs:
+            self.summary_tree.insert(
+                "",
+                "end",
+                values=(
+                    job.get("job_name", ""),
+                    job.get("estimator", ""),
+                    job.get("project_manager", ""),
+                    job.get("project_status", ""),
+                    money_fmt(job.get("bid_sheet_total", 0)),
+                ),
+            )
 
     def create_job(self):
         name = self.new_job.get().strip()
         if not name:
             return
-        job = {"id": str(uuid.uuid4())}
+        job = {"id": str(uuid.uuid4()), "config": copy.deepcopy(self.config)}
         ensure_job_defaults(job)
         job["job_name"] = name
         save_job(job)
@@ -2076,7 +2946,37 @@ class App:
         if not sel:
             return
         job = self.jobs[sel[0]]
-        open_job_window(self.root, job, self.refresh)
+        existing = self.job_tabs.get(job["id"])
+        if existing and existing.winfo_exists():
+            self.nb.select(existing)
+            return
+        config_manager = {
+            "get_all": self.get_config,
+            "get_values": self.get_config_values,
+            "add_value": self.add_config_value,
+            "register_listener": self.register_config_listener,
+        }
+        tab = open_job_tab(self.root, self.nb, job, self.refresh, self.close_job_tab, config_manager)
+        self.job_tabs[job["id"]] = tab
+
+    def close_job_tab(self, tab_frame):
+        for job_id, tab in list(self.job_tabs.items()):
+            if tab == tab_frame:
+                unregister = getattr(tab_frame, "_config_unregister", None)
+                if callable(unregister):
+                    unregister()
+                self.nb.forget(tab_frame)
+                del self.job_tabs[job_id]
+                break
+
+    def _handle_undo(self, _event=None):
+        current = self.nb.select()
+        if not current:
+            return
+        tab_widget = self.root.nametowidget(current)
+        undo = getattr(tab_widget, "_undo", None)
+        if callable(undo):
+            undo()
 
 
 if __name__ == "__main__":
