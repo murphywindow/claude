@@ -114,6 +114,36 @@ def money_fmt(v) -> str:
         iv = 0
     return f"${iv:,}" if iv else "$0"
 
+
+class ToolTip:
+    def __init__(self, widget, text_getter):
+        self.widget = widget
+        self.text_getter = text_getter
+        self.tipwindow = None
+        widget.bind("<Enter>", self.show)
+        widget.bind("<Leave>", self.hide)
+
+    def show(self, _=None):
+        text = self.text_getter() if callable(self.text_getter) else str(self.text_getter)
+        if not text:
+            return
+        if self.tipwindow is not None:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(tw, text=text, justify="left", background="#ffffe0", relief="solid", borderwidth=1,
+                       font=("Segoe UI", 8))
+        lbl.pack(ipadx=4, ipady=2)
+
+    def hide(self, _=None):
+        if self.tipwindow is not None:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
+
 def parse_pct(txt: str) -> float:
     if not txt:
         return 0.0
@@ -277,6 +307,8 @@ def default_config():
             {"key": "flashing",    "label": "Flashing and Sheet Metal",           "basis": "head_sill_subtotal", "factor": "1.00",   "rate": "8.00", "qty": "", "unit": "Linear Foot"},
             {"key": "backer_rods", "label": "Backer Rods",                        "basis": "caulk_lf_subtotal",  "factor": "1.00",   "rate": "0.50", "qty": "", "unit": "Linear Foot"},
             {"key": "sealants",    "label": "Joint Sealants",                     "basis": "caulk_lf_subtotal",  "factor": "0.0833", "rate": "12.00","qty": "", "unit": "Sausage"},
+            {"key": "tie_back",    "label": "Tie Back",                           "basis": "manual",             "factor": "",       "rate": "45.00", "qty": "", "unit": "Each"},
+            {"key": "backjamb_ins", "label": "Backjambs Insulation",              "basis": "manual",             "factor": "",       "rate": "48.32", "qty": "", "unit": "Linear Foot"},
         ],
         "sheet_type_options": ["HOLLOW METAL", "ALUM", "WOOD", "STAINLESS", "OTHER"],
         "product_type_options": ["FRAME", "DOOR", "LOUVER", "WINDOW", "CURTAINWALL", "OTHER"],
@@ -457,11 +489,28 @@ FS_HEADERS = [
     ("HEIGHT", "height", 8, "num"),
     ("SQFT", "sqft", 8, "calc"),
     ("PERIM", "perim", 8, "calc"),
+    ("CAULK PASSES", "caulk_passes", 10, "calc"),
     ("CAULK LF", "caulk_lf", 10, "calc"),
     ("HEAD/SILL", "head_sill", 10, "calc"),
 ]
 
 SUBTOTAL_KEYS = ["qty", "sqft", "perim", "caulk_lf", "head_sill"]
+
+MATERIAL_BASIS_TOOLTIPS = {
+    "perim_subtotal": "Computed as Perim subtotal × Factor",
+    "head_sill_subtotal": "Computed as Head/Sill subtotal × Factor",
+    "caulk_lf_subtotal": "Computed as Caulk LF subtotal × Factor",
+}
+
+MATERIAL_BASIS_BY_KEY = {
+    "bracing": "perim_subtotal",
+    "sheet_metal": "perim_subtotal",
+    "flashing": "head_sill_subtotal",
+    "backer_rods": "caulk_lf_subtotal",
+    "sealants": "caulk_lf_subtotal",
+    "tie_back": "manual",
+    "backjamb_ins": "manual",
+}
 
 def blank_frame_schedule_row() -> dict:
     return {
@@ -471,6 +520,7 @@ def blank_frame_schedule_row() -> dict:
         "height": "",
         "sqft": 0,
         "perim": 0,
+        "caulk_passes": "",
         "caulk_lf": 0,
         "head_sill": 0,
     }
@@ -560,6 +610,9 @@ def normalize_section(section: dict, job: dict) -> None:
         for fld in ("label", "basis", "factor", "rate", "qty", "unit"):
             if fld in existing:
                 row[fld] = existing[fld]
+        forced_basis = MATERIAL_BASIS_BY_KEY.get(k)
+        if forced_basis:
+            row["basis"] = forced_basis
         normalized.append(row)
     section["materials"] = normalized
     recompute_section_totals(section)
@@ -571,19 +624,29 @@ def normalize_fs_row(r: dict):
     r.setdefault("height", "")
     r.setdefault("sqft", 0)
     r.setdefault("perim", 0)
+    r.setdefault("caulk_passes", "")
     r.setdefault("caulk_lf", 0)
     r.setdefault("head_sill", 0)
+
+def row_has_any_input(r: dict) -> bool:
+    return any(
+        str(r.get(k, "")).strip()
+        for k in ("spec_mark", "qty", "width", "height")
+    )
 
 def recalc_row_fields(r: dict) -> None:
     qty = safe_int(r.get("qty"))
     w = safe_float(r.get("width"))
     h = safe_float(r.get("height"))
+    has_input = row_has_any_input(r)
+    caulk_passes = 3 if has_input else 0
     sqft = qty * w * h / 144.0
     perim = qty * (2 * (w + h)) / 12.0
-    caulk = perim
+    caulk = perim * caulk_passes
     hs = qty * (w / 12.0) * 2.0
     r["sqft"] = roundup(sqft)
     r["perim"] = roundup(perim)
+    r["caulk_passes"] = str(caulk_passes) if has_input else ""
     r["caulk_lf"] = roundup(caulk)
     r["head_sill"] = roundup(hs)
 
@@ -894,6 +957,7 @@ def export_frame_schedule_pdf(job: dict):
                         str(safe_float(r.get("height", "")) if str(r.get("height","")).strip() else ""),
                         str(safe_int(r.get("sqft", 0))),
                         str(safe_int(r.get("perim", 0))),
+                        str(r.get("caulk_passes", "")),
                         str(safe_int(r.get("caulk_lf", 0))),
                         str(safe_int(r.get("head_sill", 0))),
                     ])
@@ -908,7 +972,7 @@ def export_frame_schedule_pdf(job: dict):
                         subtotal_row.append("")
                 table_data.append(subtotal_row)
 
-                t = Table(table_data, repeatRows=1, colWidths=[95, 35, 45, 45, 40, 40, 50, 50])
+                t = Table(table_data, repeatRows=1, colWidths=[90, 32, 42, 42, 38, 38, 45, 45, 45])
                 t.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#666666")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -2029,6 +2093,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             recalc_row_fields(rdata)
             fields["sqft_var"].set(str(safe_int(rdata["sqft"])))
             fields["perim_var"].set(str(safe_int(rdata["perim"])))
+            fields["caulk_passes_var"].set(str(rdata.get("caulk_passes", "")))
             fields["caulk_var"].set(str(safe_int(rdata["caulk_lf"])))
             fields["hs_var"].set(str(safe_int(rdata["head_sill"])))
 
@@ -2066,8 +2131,9 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             ttk.Label(self.grid, text="").grid(row=r, column=3, padx=3, sticky="e")
             ttk.Label(self.grid, textvariable=self.sub_vars["sqft"], font=("Segoe UI", 9, "bold")).grid(row=r, column=4, padx=3, sticky="e")
             ttk.Label(self.grid, textvariable=self.sub_vars["perim"], font=("Segoe UI", 9, "bold")).grid(row=r, column=5, padx=3, sticky="e")
-            ttk.Label(self.grid, textvariable=self.sub_vars["caulk_lf"], font=("Segoe UI", 9, "bold")).grid(row=r, column=6, padx=3, sticky="e")
-            ttk.Label(self.grid, textvariable=self.sub_vars["head_sill"], font=("Segoe UI", 9, "bold")).grid(row=r, column=7, padx=3, sticky="e")
+            ttk.Label(self.grid, text="", font=("Segoe UI", 9, "bold")).grid(row=r, column=6, padx=3, sticky="e")
+            ttk.Label(self.grid, textvariable=self.sub_vars["caulk_lf"], font=("Segoe UI", 9, "bold")).grid(row=r, column=7, padx=3, sticky="e")
+            ttk.Label(self.grid, textvariable=self.sub_vars["head_sill"], font=("Segoe UI", 9, "bold")).grid(row=r, column=8, padx=3, sticky="e")
 
         def _add_row_widgets(self, rdata: dict):
             normalize_fs_row(rdata)
@@ -2088,6 +2154,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
             sqft_var = tk.StringVar(value=str(safe_int(rdata.get("sqft", 0))))
             perim_var = tk.StringVar(value=str(safe_int(rdata.get("perim", 0))))
+            caulk_passes_var = tk.StringVar(value=str(rdata.get("caulk_passes", "")))
             caulk_var = tk.StringVar(value=str(safe_int(rdata.get("caulk_lf", 0))))
             hs_var = tk.StringVar(value=str(safe_int(rdata.get("head_sill", 0))))
 
@@ -2097,11 +2164,12 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             height.grid(row=rowi, column=3, padx=3, pady=2, sticky="w")
             ttk.Label(self.grid, textvariable=sqft_var, width=8, anchor="e").grid(row=rowi, column=4, padx=3, pady=2, sticky="e")
             ttk.Label(self.grid, textvariable=perim_var, width=8, anchor="e").grid(row=rowi, column=5, padx=3, pady=2, sticky="e")
-            ttk.Label(self.grid, textvariable=caulk_var, width=10, anchor="e").grid(row=rowi, column=6, padx=3, pady=2, sticky="e")
-            ttk.Label(self.grid, textvariable=hs_var, width=10, anchor="e").grid(row=rowi, column=7, padx=3, pady=2, sticky="e")
+            ttk.Label(self.grid, textvariable=caulk_passes_var, width=10, anchor="e").grid(row=rowi, column=6, padx=3, pady=2, sticky="e")
+            ttk.Label(self.grid, textvariable=caulk_var, width=10, anchor="e").grid(row=rowi, column=7, padx=3, pady=2, sticky="e")
+            ttk.Label(self.grid, textvariable=hs_var, width=10, anchor="e").grid(row=rowi, column=8, padx=3, pady=2, sticky="e")
 
             del_btn = ttk.Button(self.grid, text="×", width=2)
-            del_btn.grid(row=rowi, column=8, padx=2, pady=2)
+            del_btn.grid(row=rowi, column=9, padx=2, pady=2)
 
             fields = {
                 "spec_mark": spec_mark,
@@ -2110,6 +2178,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 "height": height,
                 "sqft_var": sqft_var,
                 "perim_var": perim_var,
+                "caulk_passes_var": caulk_passes_var,
                 "caulk_var": caulk_var,
                 "hs_var": hs_var,
                 "del_btn": del_btn,
@@ -2186,7 +2255,11 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
                 basis = ttk.Combobox(self.mat_grid, state="readonly", width=20,
                                      values=["perim_subtotal", "head_sill_subtotal", "caulk_lf_subtotal", "manual"])
-                basis.set(m.get("basis", "perim_subtotal"))
+                enforced_basis = MATERIAL_BASIS_BY_KEY.get(m.get("key", ""), m.get("basis", "perim_subtotal"))
+                m["basis"] = enforced_basis
+                basis.set(enforced_basis)
+                if m.get("key", "") in MATERIAL_BASIS_BY_KEY:
+                    basis.configure(state="disabled")
 
                 factor = ttk.Entry(self.mat_grid, width=8)
                 factor.insert(0, m.get("factor", "1.0"))
@@ -2204,8 +2277,11 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 basis.grid(row=i, column=1, padx=3, pady=2, sticky="w")
                 factor.grid(row=i, column=2, padx=3, pady=2, sticky="w")
                 rate.grid(row=i, column=3, padx=3, pady=2, sticky="w")
-                ttk.Label(self.mat_grid, textvariable=qty_var, width=10, anchor="e").grid(row=i, column=4, padx=3, pady=2, sticky="e")
+                qty_lbl = ttk.Label(self.mat_grid, textvariable=qty_var, width=10, anchor="e")
+                qty_lbl.grid(row=i, column=4, padx=3, pady=2, sticky="e")
                 ttk.Label(self.mat_grid, textvariable=cost_var, width=10, anchor="e").grid(row=i, column=5, padx=3, pady=2, sticky="e")
+                if m.get("basis") != "manual":
+                    ToolTip(qty_lbl, lambda rw=basis: MATERIAL_BASIS_TOOLTIPS.get(rw.get().strip(), ""))
                 unit.grid(row=i, column=6, padx=3, pady=2, sticky="w")
 
                 row = {
