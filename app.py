@@ -463,6 +463,18 @@ FS_HEADERS = [
 
 SUBTOTAL_KEYS = ["qty", "sqft", "perim", "caulk_lf", "head_sill"]
 
+def blank_frame_schedule_row() -> dict:
+    return {
+        "spec_mark": "",
+        "qty": "",
+        "width": "",
+        "height": "",
+        "sqft": 0,
+        "perim": 0,
+        "caulk_lf": 0,
+        "head_sill": 0,
+    }
+
 def normalize_frame_schedules(job: dict) -> None:
     job.setdefault("frame_schedules", {})
     valid_specs = build_valid_frame_spec_ids(job)
@@ -489,6 +501,40 @@ def normalize_frame_schedules(job: dict) -> None:
         if spec_id not in valid_specs:
             del job["frame_schedules"][spec_id]
 
+def is_valid_frame_spec_id(job: dict, spec_id: str) -> bool:
+    return spec_id in build_valid_frame_spec_ids(job)
+
+def create_frame_schedule_section(job: dict, spec_id: str):
+    if not spec_id or not is_valid_frame_spec_id(job, spec_id):
+        return None, "Please select a valid cost code before adding a section."
+
+    job.setdefault("frame_schedules", {})
+    current_sections = job["frame_schedules"].get(spec_id, [])
+    if not isinstance(current_sections, list):
+        current_sections = []
+
+    existing_ids = {
+        (s.get("id") or "").strip()
+        for s in current_sections
+        if isinstance(s, dict)
+    }
+    section_id = str(uuid.uuid4())
+    while section_id in existing_ids:
+        section_id = str(uuid.uuid4())
+
+    next_index = len(current_sections) + 1
+    new_section = {
+        "id": section_id,
+        "name": f"Section {next_index}",
+        "rows": [blank_frame_schedule_row()],
+        "materials": copy.deepcopy(job.get("config", {}).get("materials", default_config()["materials"])),
+    }
+    normalize_section(new_section, job)
+
+    # immutable append so UI/state never relies on list mutation side effects
+    job["frame_schedules"][spec_id] = list(current_sections) + [new_section]
+    return new_section, ""
+
 def normalize_section(section: dict, job: dict) -> None:
     section.setdefault("id", str(uuid.uuid4()))
     section.setdefault("name", "Section")
@@ -496,6 +542,8 @@ def normalize_section(section: dict, job: dict) -> None:
     section.setdefault("materials", copy.deepcopy(job.get("config", {}).get("materials", default_config()["materials"])))
     if not isinstance(section["rows"], list):
         section["rows"] = []
+    if not section["rows"]:
+        section["rows"] = [blank_frame_schedule_row()]
     if not isinstance(section["materials"], list):
         section["materials"] = []
 
@@ -1875,7 +1923,8 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
     ttk.Label(selector_frame, text="Select Spec:").pack(side="left")
     spec_combo = ttk.Combobox(selector_frame, state="readonly", width=40, textvariable=selected_spec_label_var)
     spec_combo.pack(side="left", padx=8)
-    ttk.Button(selector_frame, text="+ Add Section", command=lambda: add_section_ui()).pack(side="left", padx=4)
+    add_section_btn = ttk.Button(selector_frame, text="+ Add Section", command=lambda: add_section_ui())
+    add_section_btn.pack(side="left", padx=4)
     ttk.Button(selector_frame, text="Export PDF", command=lambda: export_frame_schedule_pdf(job)).pack(side="left", padx=4)
     frame_schedule_error = ttk.Label(selector_frame, textvariable=frame_schedule_error_var, foreground="#b00020")
     frame_schedule_error.pack(side="left", padx=8)
@@ -1960,7 +2009,24 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             refresh_frame_schedule_ui()
             mark_frame_dirty()
 
-        def _row_commit(self, rdata: dict, fields: dict):
+        def _is_last_row(self, rdata: dict) -> bool:
+            rows = self.section.get("rows", [])
+            return bool(rows) and rows[-1] is rdata
+
+        def _append_blank_row(self, persist: bool = True):
+            r = blank_frame_schedule_row()
+            self.section["rows"] = list(self.section.get("rows", [])) + [r]
+            self._add_row_widgets(r)
+            if persist:
+                save_job(job)
+                mark_frame_dirty()
+
+        def _maybe_append_blank_row_for_qty(self, rdata: dict):
+            qty_text = str(rdata.get("qty", "")).strip()
+            if qty_text and self._is_last_row(rdata):
+                self._append_blank_row(persist=False)
+
+        def _row_commit(self, rdata: dict, fields: dict, persist: bool = True):
             rdata["spec_mark"] = fields["spec_mark"].get().strip()
             rdata["qty"] = fields["qty"].get().strip()
             rdata["width"] = fields["width"].get().strip()
@@ -1970,9 +2036,14 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             fields["perim_var"].set(str(safe_int(rdata["perim"])))
             fields["caulk_var"].set(str(safe_int(rdata["caulk_lf"])))
             fields["hs_var"].set(str(safe_int(rdata["head_sill"])))
-            save_job(job)
+
+            self._maybe_append_blank_row_for_qty(rdata)
+
+            if persist:
+                save_job(job)
             self.update_subtotals_and_materials()
-            mark_frame_dirty()
+            if persist:
+                mark_frame_dirty()
 
         def _remove_subtotal_row_widgets(self):
             if self.subtotal_row_index is None:
@@ -2009,14 +2080,15 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
             rowi = len(self.row_widgets) + 1
             spec_mark = ttk.Entry(self.grid, width=18)
-            qty = ttk.Entry(self.grid, width=8)
-            width = ttk.Entry(self.grid, width=8)
-            height = ttk.Entry(self.grid, width=8)
+            qty_var_input = tk.StringVar(value=rdata.get("qty", ""))
+            width_var_input = tk.StringVar(value=rdata.get("width", ""))
+            height_var_input = tk.StringVar(value=rdata.get("height", ""))
+
+            qty = ttk.Entry(self.grid, width=8, textvariable=qty_var_input)
+            width = ttk.Entry(self.grid, width=8, textvariable=width_var_input)
+            height = ttk.Entry(self.grid, width=8, textvariable=height_var_input)
 
             spec_mark.insert(0, rdata.get("spec_mark", ""))
-            qty.insert(0, rdata.get("qty", ""))
-            width.insert(0, rdata.get("width", ""))
-            height.insert(0, rdata.get("height", ""))
 
             sqft_var = tk.StringVar(value=str(safe_int(rdata.get("sqft", 0))))
             perim_var = tk.StringVar(value=str(safe_int(rdata.get("perim", 0))))
@@ -2040,6 +2112,9 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 "qty": qty,
                 "width": width,
                 "height": height,
+                "qty_var_input": qty_var_input,
+                "width_var_input": width_var_input,
+                "height_var_input": height_var_input,
                 "sqft_var": sqft_var,
                 "perim_var": perim_var,
                 "caulk_var": caulk_var,
@@ -2051,14 +2126,29 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             def commit(_=None):
                 self._row_commit(rdata, fields)
 
+            def commit_live(_=None):
+                self._row_commit(rdata, fields, persist=False)
+
+            def live_trace_handler(*_):
+                self._row_commit(rdata, fields, persist=False)
+
             for w in (spec_mark, qty, width, height):
                 w.bind("<FocusOut>", commit)
                 w.bind("<Return>", commit)
+            for w in (qty, width, height):
+                w.bind("<KeyRelease>", commit_live)
+
+            qty_var_input.trace_add("write", live_trace_handler)
+            width_var_input.trace_add("write", live_trace_handler)
+            height_var_input.trace_add("write", live_trace_handler)
 
             def delete_row():
                 snapshot()
                 rows = self.section["rows"]
-                rows[:] = [x for x in rows if x is not rdata]
+                remaining = [x for x in rows if x is not rdata]
+                if not remaining:
+                    remaining = [blank_frame_schedule_row()]
+                self.section["rows"] = remaining
                 save_job(job)
                 self.rebuild_rows()
                 self.update_subtotals_and_materials()
@@ -2088,8 +2178,8 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
         def add_row(self):
             snapshot()
-            r = {"spec_mark": "", "qty": "", "width": "", "height": "", "sqft": 0, "perim": 0, "caulk_lf": 0, "head_sill": 0}
-            self.section["rows"].append(r)
+            r = blank_frame_schedule_row()
+            self.section["rows"] = list(self.section.get("rows", [])) + [r]
             save_job(job)
             self._add_row_widgets(r)
             self.update_subtotals_and_materials()
@@ -2200,6 +2290,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
     def frame_spec_options():
         opts = []
+        seen_labels = set()
         for cc in sorted(job["cost_codes"], key=lambda x: (x.get("code") or "")):
             code = (cc.get("code") or "").strip()
             if not code:
@@ -2207,12 +2298,21 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             desc = cc.get("description", "")
             for v in variants_for_cc(cc.get("alts", [])):
                 sid = frame_spec_id(code, v)
-                lbl = f"{frame_spec_label(code, v)} — {desc}"
+                lbl = f"{frame_spec_label(code, v)} — {desc}".strip()
+                if lbl in seen_labels:
+                    lbl = f"{lbl} [{sid}]"
+                seen_labels.add(lbl)
                 opts.append((sid, lbl))
         return opts
 
     def set_frame_schedule_error(message: str):
         frame_schedule_error_var.set(message)
+
+    def update_add_section_button_state(spec_id: str):
+        if is_valid_frame_spec_id(job, spec_id):
+            add_section_btn.configure(state="normal")
+        else:
+            add_section_btn.configure(state="disabled")
 
     def resolve_current_spec_id(opts=None):
         options = opts if opts is not None else frame_spec_options()
@@ -2244,7 +2344,6 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
     def refresh_frame_schedule_ui():
         normalize_frame_schedules(job)
         compute_frame_schedule_rollups(job)
-        set_frame_schedule_error("")
 
         for w in sections_wrap.winfo_children():
             w.destroy()
@@ -2261,6 +2360,8 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             cur_sid = ids[0] if ids else ""
             current_spec_id_var.set(cur_sid)
 
+        update_add_section_button_state(cur_sid)
+
         # set combobox display text by current sid
         display = ""
         for sid, lbl in opts:
@@ -2271,8 +2372,11 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
         spec_combo.set(display)
 
         if not cur_sid:
+            set_frame_schedule_error("Please add and select a valid cost code before adding a section.")
             ttk.Label(sections_wrap, text="No cost codes available. Add cost codes first.").pack(anchor="w", pady=8)
             return
+
+        set_frame_schedule_error("")
 
         sections = job["frame_schedules"].setdefault(cur_sid, [])
         if not sections:
@@ -2294,34 +2398,38 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             set_frame_schedule_error("")
             current_spec_id_var.set(sid)
             selected_spec_label_var.set(selected_label)
+            update_add_section_button_state(sid)
             refresh_frame_schedule_ui()
         else:
             current_spec_id_var.set("")
             set_frame_schedule_error("Please select a valid cost code before adding a section.")
+            update_add_section_button_state("")
 
     spec_combo.bind("<<ComboboxSelected>>", on_spec_combo_selected)
 
     def add_section_ui():
         sid = resolve_current_spec_id()
-        if not sid:
-            set_frame_schedule_error("Please select a valid cost code before adding a section.")
-            messagebox.showerror("Invalid Cost Code", "Select a valid cost code before adding a section.")
+        if not sid or not is_valid_frame_spec_id(job, sid):
+            err = "Please select a valid cost code before adding a section."
+            set_frame_schedule_error(err)
+            messagebox.showerror("Invalid Cost Code", err)
+            update_add_section_button_state("")
             return
         set_frame_schedule_error("")
         snapshot()
-        sections = list(job["frame_schedules"].get(sid, []))
-        sec = {
-            "id": str(uuid.uuid4()),
-            "name": f"Section {len(sections)+1}",
-            "rows": [],
-            "materials": copy.deepcopy(job.get("config", {}).get("materials", default_config()["materials"])),
-        }
-        normalize_section(sec, job)
-        sections = sections + [sec]
-        job["frame_schedules"][sid] = sections
-        save_job(job)
-        refresh_frame_schedule_ui()
-        mark_frame_dirty()
+        _, err = create_frame_schedule_section(job, sid)
+        if err:
+            set_frame_schedule_error(err)
+            messagebox.showerror("Unable to Add Section", err)
+            return
+        try:
+            save_job(job)
+            refresh_frame_schedule_ui()
+            mark_frame_dirty()
+        except Exception as ex:
+            err_msg = f"Unable to persist new section: {ex}"
+            set_frame_schedule_error(err_msg)
+            messagebox.showerror("Unable to Add Section", err_msg)
 
     # --------------------------------------------------
     # Save-on-close / autosave hooks
