@@ -261,9 +261,61 @@ class ScrollFrame(ttk.Frame):
 
         self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.window_id, width=e.width))
+        self.canvas.bind("<Enter>", self._bind_mousewheel)
+        self.canvas.bind("<Leave>", self._unbind_mousewheel)
 
         self.canvas.pack(side="left", fill="both", expand=True)
         self.vsb.pack(side="right", fill="y")
+
+    def _bind_mousewheel(self, _event=None):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Shift-MouseWheel>", self._on_shift_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_linux_scroll_up)
+        self.canvas.bind_all("<Button-5>", self._on_linux_scroll_down)
+
+    def _unbind_mousewheel(self, _event=None):
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Shift-MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, event):
+        if event.delta == 0:
+            return "break"
+        steps = int(-event.delta / 120)
+        if steps == 0:
+            steps = -1 if event.delta > 0 else 1
+        self.canvas.yview_scroll(steps, "units")
+        return "break"
+
+    def _on_shift_mousewheel(self, event):
+        if event.delta == 0:
+            return "break"
+        steps = int(-event.delta / 120)
+        if steps == 0:
+            steps = -1 if event.delta > 0 else 1
+        self.canvas.xview_scroll(steps, "units")
+        return "break"
+
+    def _on_linux_scroll_up(self, _event):
+        self.canvas.yview_scroll(-1, "units")
+        return "break"
+
+    def _on_linux_scroll_down(self, _event):
+        self.canvas.yview_scroll(1, "units")
+        return "break"
+
+    def snap_to_widget(self, widget):
+        self.update_idletasks()
+        self.canvas.update_idletasks()
+        bbox = self.canvas.bbox(self.window_id)
+        if not bbox:
+            return
+        inner_top = bbox[1]
+        inner_height = max(bbox[3] - bbox[1], 1)
+        widget_top = widget.winfo_rooty() - self.inner.winfo_rooty()
+        target = max(0.0, min(widget_top / inner_height, 1.0))
+        self.canvas.yview_moveto(target)
 
 
 # ======================================================
@@ -550,6 +602,7 @@ def normalize_frame_schedules(job: dict) -> None:
             job["frame_schedules"][spec_id] = sections
 
         seen_section_ids = set()
+        seen_names = set()
         deduped_sections = []
         for section in sections:
             normalize_section(section, job)
@@ -558,6 +611,15 @@ def normalize_frame_schedules(job: dict) -> None:
                 section_id = str(uuid.uuid4())
                 section["id"] = section_id
             seen_section_ids.add(section_id)
+
+            base_name = (section.get("name") or "Section").strip() or "Section"
+            name = base_name
+            idx = 2
+            while name in seen_names:
+                name = f"{base_name} ({idx})"
+                idx += 1
+            section["name"] = name
+            seen_names.add(name)
             deduped_sections.append(section)
         job["frame_schedules"][spec_id] = deduped_sections
 
@@ -1150,6 +1212,10 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
     frame_schedule_error_var = tk.StringVar(value="")
     sections_container_ref = {"frame": None}
     section_uis = []
+    spec_collapsed_state = {}
+    toc_collapsed = {"value": False}
+    toc_section_widget_map = {}
+    toc_spec_widget_map = {}
 
     def do_undo():
         prev = undo.undo()
@@ -2067,8 +2133,24 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
     tab_fs = ttk.Frame(nb)
     nb.add(tab_fs, text="Frame Schedule")
 
-    fs_scroll = ScrollFrame(tab_fs)
-    fs_scroll.pack(fill="both", expand=True, padx=10, pady=10)
+    fs_main = ttk.Frame(tab_fs)
+    fs_main.pack(fill="both", expand=True, padx=10, pady=10)
+
+    fs_style = ttk.Style()
+    fs_style.configure("ReadableReadonly.TEntry", fieldbackground="white", foreground="black")
+    fs_style.map("ReadableReadonly.TEntry", fieldbackground=[("readonly", "white")], foreground=[("readonly", "black")])
+
+    fs_scroll = ScrollFrame(fs_main)
+    fs_scroll.pack(side="left", fill="both", expand=True)
+
+    toc_host = ttk.Frame(fs_main)
+    toc_host.pack(side="right", fill="y", padx=(8, 0))
+    toc_toggle_btn = ttk.Button(toc_host, text="◀", width=2)
+    toc_toggle_btn.pack(side="left", fill="y")
+    toc_panel = ttk.LabelFrame(toc_host, text="Navigation", width=250)
+    toc_panel.pack(side="left", fill="y")
+    toc_tree = ttk.Treeview(toc_panel, show="tree", selectmode="browse", height=24)
+    toc_tree.pack(fill="both", expand=True, padx=6, pady=6)
 
     selector_frame = ttk.Frame(fs_scroll.inner)
     selector_frame.pack(anchor="w", pady=6, fill="x")
@@ -2094,6 +2176,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             self.row_widgets = []
             self.material_widgets = []
             self.subtotal_row_index = None
+            self.section.setdefault("collapsed", False)
 
             self.outer = ttk.LabelFrame(master, text=section.get("name", "Section"))
             self.outer.pack(fill="x", pady=8)
@@ -2104,32 +2187,44 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             self.name_entry = ttk.Entry(head, width=30)
             self.name_entry.insert(0, section.get("name", "Section"))
             self.name_entry.pack(side="left", padx=6)
-            ttk.Button(head, text="Delete Section", command=self.delete_section).pack(side="right")
+
+            right_controls = ttk.Frame(head)
+            right_controls.pack(side="right")
+            self.section_toggle_wrap = ttk.Frame(right_controls)
+            self.section_toggle_wrap.pack(side="right", padx=(6, 0))
+            self.section_toggle_btn = ttk.Button(self.section_toggle_wrap, text="Minimize", width=10, command=self.toggle_minimized)
+            self.section_toggle_btn.pack(anchor="e")
+            self.section_note_var = tk.StringVar(value="")
+            ttk.Label(self.section_toggle_wrap, textvariable=self.section_note_var, font=("Segoe UI", 8)).pack(anchor="e")
+
+            ttk.Button(right_controls, text="Delete Section", command=self.delete_section).pack(side="right", padx=(6, 0))
+            ttk.Button(right_controls, text="Duplicate", command=self.duplicate_section).pack(side="right")
+
             self.name_entry.bind("<FocusOut>", self.save_name)
             self.name_entry.bind("<Return>", self.save_name)
 
-            self.grid = ttk.Frame(self.outer)
+            self.content = ttk.Frame(self.outer)
+            self.content.pack(fill="x")
+
+            self.grid = ttk.Frame(self.content)
             self.grid.pack(fill="x", padx=6, pady=4)
 
-            # headers
             for c, (h, key, w, kind) in enumerate(FS_HEADERS):
                 ttk.Label(self.grid, text=h).grid(row=0, column=c, padx=3, sticky="w")
 
-            # Build rows
             for r in self.section["rows"]:
                 self._add_row_widgets(r)
 
             self._render_subtotal_row()
 
-            # Material table
-            sep = ttk.Separator(self.outer, orient="horizontal")
+            sep = ttk.Separator(self.content, orient="horizontal")
             sep.pack(fill="x", padx=6, pady=6)
 
-            mat_head = ttk.Frame(self.outer)
+            mat_head = ttk.Frame(self.content)
             mat_head.pack(fill="x", padx=6)
             ttk.Label(mat_head, text="INSTALL MATERIAL BREAKDOWN", font=("Segoe UI", 9, "bold")).pack(anchor="w")
 
-            self.mat_grid = ttk.Frame(self.outer)
+            self.mat_grid = ttk.Frame(self.content)
             self.mat_grid.pack(fill="x", padx=6, pady=(4, 6))
 
             mh = ["Material", "Factor", "Rate", "Qty", "Cost", "Unit"]
@@ -2138,15 +2233,21 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
             self._build_material_rows()
             self.update_subtotals_and_materials()
+            self._apply_collapsed_state()
 
         def save_name(self, _=None):
-            new_name = self.name_entry.get().strip() or "Section"
-            if new_name != self.section.get("name", "Section"):
+            requested = self.name_entry.get().strip() or "Section"
+            unique = get_unique_section_name(self.spec_id, requested, self.section.get("id"))
+            if unique != requested:
+                self.name_entry.delete(0, tk.END)
+                self.name_entry.insert(0, unique)
+            if unique != self.section.get("name", "Section"):
                 snapshot()
-                self.section["name"] = new_name
-                self.outer.configure(text=new_name)
+                self.section["name"] = unique
+                self.outer.configure(text=unique)
                 save_job(job)
                 mark_frame_dirty()
+                refresh_frame_schedule_ui()
 
         def delete_section(self):
             if not messagebox.askyesno("Delete Section", "Delete this section?"):
@@ -2159,6 +2260,47 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             save_job(job)
             refresh_frame_schedule_ui()
             mark_frame_dirty()
+
+        def duplicate_section(self):
+            snapshot()
+            sections = list(job["frame_schedules"].get(self.spec_id, []))
+            dup = copy.deepcopy(self.section)
+            dup["id"] = str(uuid.uuid4())
+            dup["collapsed"] = False
+            self.section["name"] = get_unique_section_name(self.spec_id, "Section 1", self.section.get("id"))
+            dup["name"] = get_unique_section_name(self.spec_id, "Section 2", dup["id"])
+            out = []
+            inserted = False
+            for sec in sections:
+                out.append(sec)
+                if sec.get("id") == self.section.get("id"):
+                    out.append(dup)
+                    inserted = True
+            if not inserted:
+                out.append(dup)
+            job["frame_schedules"][self.spec_id] = out
+            save_job(job)
+            refresh_frame_schedule_ui()
+            mark_frame_dirty()
+
+        def toggle_minimized(self):
+            self.section["collapsed"] = not bool(self.section.get("collapsed", False))
+            self._apply_collapsed_state()
+            save_job(job)
+            mark_frame_dirty()
+
+        def _apply_collapsed_state(self):
+            collapsed = bool(self.section.get("collapsed", False))
+            if collapsed:
+                self.content.pack_forget()
+                self.section_toggle_btn.configure(text="Expand")
+                recompute_section_totals(self.section)
+                self.section_note_var.set(f"Install material total: {money_fmt(self.section.get('_install_total', 0))}")
+            else:
+                if not self.content.winfo_manager():
+                    self.content.pack(fill="x")
+                self.section_toggle_btn.configure(text="Minimize")
+                self.section_note_var.set("")
 
         def _is_last_row(self, rdata: dict) -> bool:
             rows = self.section.get("rows", [])
@@ -2392,7 +2534,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 label = ttk.Entry(self.mat_grid, width=34)
                 label.insert(0, m.get("label", ""))
                 if is_locked_name:
-                    label.configure(state="disabled")
+                    label.configure(state="readonly", style="ReadableReadonly.TEntry")
 
                 factor = ttk.Entry(self.mat_grid, width=8)
                 factor.insert(0, m.get("factor", "1.0"))
@@ -2414,7 +2556,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 unit = ttk.Entry(self.mat_grid, width=12)
                 unit.insert(0, m.get("unit", ""))
                 if not is_manual:
-                    unit.configure(state="disabled")
+                    unit.configure(state="readonly", style="ReadableReadonly.TEntry")
 
                 label.grid(row=i, column=0, padx=3, pady=2, sticky="w")
                 factor.grid(row=i, column=1, padx=3, pady=2, sticky="w")
@@ -2522,6 +2664,20 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 opts.append((sid, lbl))
         return opts
 
+    def get_unique_section_name(spec_id: str, candidate: str, exclude_id: str | None = None):
+        desired = (candidate or "Section").strip() or "Section"
+        names = {
+            (s.get("name") or "Section").strip()
+            for s in job.get("frame_schedules", {}).get(spec_id, [])
+            if s.get("id") != exclude_id
+        }
+        if desired not in names:
+            return desired
+        idx = 2
+        while f"{desired} ({idx})" in names:
+            idx += 1
+        return f"{desired} ({idx})"
+
     def set_frame_schedule_error(message: str):
         frame_schedule_error_var.set(message)
 
@@ -2551,6 +2707,57 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
         return ""
 
+    def toggle_spec_minimize(spec_id: str, body: ttk.Frame, button: ttk.Button, note_var: tk.StringVar):
+        is_collapsed = not spec_collapsed_state.get(spec_id, False)
+        spec_collapsed_state[spec_id] = is_collapsed
+        if is_collapsed:
+            body.pack_forget()
+            button.configure(text="Expand")
+            total = safe_int(job.get("frame_schedule_rollups", {}).get(spec_id, {}).get("install_total", 0))
+            note_var.set(f"Install material total: {money_fmt(total)}")
+        else:
+            body.pack(fill="x", padx=6, pady=(0, 6))
+            button.configure(text="Minimize")
+            note_var.set("")
+
+    def rebuild_toc():
+        toc_tree.delete(*toc_tree.get_children())
+        for sid, label in frame_spec_options():
+            spec_item = toc_tree.insert("", "end", text=label)
+            spec_widget = toc_spec_widget_map.get(sid)
+            if spec_widget is not None:
+                toc_spec_widget_map[spec_item] = spec_widget
+            for sec in job.get("frame_schedules", {}).get(sid, []):
+                section_name = (sec.get("name") or "Section").strip() or "Section"
+                child = toc_tree.insert(spec_item, "end", text=section_name)
+                sec_widget = toc_section_widget_map.get((sid, sec.get("id")))
+                if sec_widget is not None:
+                    toc_section_widget_map[child] = sec_widget
+
+    def toggle_toc_panel():
+        toc_collapsed["value"] = not toc_collapsed["value"]
+        if toc_collapsed["value"]:
+            toc_panel.pack_forget()
+            toc_toggle_btn.configure(text="▶")
+        else:
+            toc_panel.pack(side="left", fill="y")
+            toc_toggle_btn.configure(text="◀")
+
+    def on_toc_selected(_=None):
+        item = toc_tree.focus()
+        if not item:
+            return
+        if item in toc_spec_widget_map:
+            widget = toc_spec_widget_map[item]
+            fs_scroll.snap_to_widget(widget)
+            return
+        if item in toc_section_widget_map:
+            widget = toc_section_widget_map[item]
+            fs_scroll.snap_to_widget(widget)
+
+    toc_toggle_btn.configure(command=toggle_toc_panel)
+    toc_tree.bind("<<TreeviewSelect>>", on_toc_selected)
+
     def ensure_frame_initialized():
         nonlocal frame_initialized
         if frame_initialized:
@@ -2565,13 +2772,14 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
         for w in sections_wrap.winfo_children():
             w.destroy()
         section_uis.clear()
+        toc_spec_widget_map.clear()
+        toc_section_widget_map.clear()
 
         opts = frame_spec_options()
         labels = [lbl for _, lbl in opts]
         ids = [sid for sid, _ in opts]
         spec_combo["values"] = labels
 
-        # current selection
         cur_sid = resolve_current_spec_id(opts)
         if cur_sid not in ids:
             cur_sid = ids[0] if ids else ""
@@ -2579,7 +2787,6 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
         update_add_section_button_state(cur_sid)
 
-        # set combobox display text by current sid
         display = ""
         for sid, lbl in opts:
             if sid == cur_sid:
@@ -2595,26 +2802,49 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
         if not opts:
             ttk.Label(sections_wrap, text="No cost codes available. Add cost codes first.").pack(anchor="w", pady=8)
+            rebuild_toc()
             return
 
         has_any_sections = False
         label_by_id = {sid: lbl for sid, lbl in opts}
         for sid in ids:
             sections = job["frame_schedules"].setdefault(sid, [])
-            spec_wrap = ttk.LabelFrame(sections_wrap, text=label_by_id.get(sid, sid))
-            spec_wrap.pack(fill="x", pady=6)
+            spec_box = ttk.LabelFrame(sections_wrap, text=label_by_id.get(sid, sid))
+            spec_box.pack(fill="x", pady=6)
+
+            spec_header = ttk.Frame(spec_box)
+            spec_header.pack(fill="x", padx=6, pady=(4, 2))
+            spec_ctrl = ttk.Frame(spec_header)
+            spec_ctrl.pack(side="right")
+            spec_note_var = tk.StringVar(value="")
+            spec_btn = ttk.Button(spec_ctrl, text="Minimize", width=10)
+            spec_btn.pack(anchor="e")
+            ttk.Label(spec_ctrl, textvariable=spec_note_var, font=("Segoe UI", 8)).pack(anchor="e")
+
+            spec_body = ttk.Frame(spec_box)
+            spec_body.pack(fill="x", padx=6, pady=(0, 6))
+
+            spec_btn.configure(command=lambda _sid=sid, _body=spec_body, _btn=spec_btn, _note=spec_note_var: toggle_spec_minimize(_sid, _body, _btn, _note))
+
+            toc_spec_widget_map[sid] = spec_box
+
             if not sections:
-                ttk.Label(spec_wrap, text="No sections yet for this spec.").pack(anchor="w", padx=6, pady=6)
-                continue
-            has_any_sections = True
-            for sec in sections:
-                normalize_section(sec, job)
-                ui = SectionUI(spec_wrap, sec, sid)
-                section_uis.append(ui)
+                ttk.Label(spec_body, text="No sections yet for this spec.").pack(anchor="w", padx=6, pady=6)
+            else:
+                has_any_sections = True
+                for sec in sections:
+                    normalize_section(sec, job)
+                    ui = SectionUI(spec_body, sec, sid)
+                    section_uis.append(ui)
+                    toc_section_widget_map[(sid, sec.get("id"))] = ui.outer
+
+            if spec_collapsed_state.get(sid, False):
+                toggle_spec_minimize(sid, spec_body, spec_btn, spec_note_var)
 
         if not has_any_sections:
             ttk.Label(sections_wrap, text="No sections yet. Use '+ Add Section' to add one for the selected spec.").pack(anchor="w", pady=6)
 
+        rebuild_toc()
     def on_spec_combo_selected(_=None):
         selected_label = spec_combo.get().strip()
         sid = ""
