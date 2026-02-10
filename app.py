@@ -487,6 +487,13 @@ FS_HEADERS = [
     ("QTY", "qty", 6, "num"),
     ("WIDTH", "width", 8, "num"),
     ("HEIGHT", "height", 8, "num"),
+    ("HEAD", "head", 8, "text"),
+    ("JAMB", "jamb", 8, "text"),
+    ("SILL", "sill", 8, "text"),
+    ("TYPE", "type", 10, "text"),
+    ("MATL", "matl", 10, "text"),
+    ("FINISH", "finish", 10, "text"),
+    ("NOTES", "notes", 14, "text"),
     ("SQFT", "sqft", 8, "calc"),
     ("PERIM", "perim", 8, "calc"),
     ("CAULK PASSES", "caulk_passes", 10, "calc"),
@@ -518,6 +525,13 @@ def blank_frame_schedule_row() -> dict:
         "qty": "",
         "width": "",
         "height": "",
+        "head": "",
+        "jamb": "",
+        "sill": "",
+        "type": "",
+        "matl": "",
+        "finish": "",
+        "notes": "",
         "sqft": 0,
         "perim": 0,
         "caulk_passes": "",
@@ -614,7 +628,7 @@ def normalize_section(section: dict, job: dict) -> None:
         if forced_basis:
             row["basis"] = forced_basis
         normalized.append(row)
-    section["materials"] = normalized
+    section["materials"] = ensure_single_trailing_manual_material_row(normalized)
     recompute_section_totals(section)
 
 def normalize_fs_row(r: dict):
@@ -622,6 +636,13 @@ def normalize_fs_row(r: dict):
     r.setdefault("qty", "")
     r.setdefault("width", "")
     r.setdefault("height", "")
+    r.setdefault("head", "")
+    r.setdefault("jamb", "")
+    r.setdefault("sill", "")
+    r.setdefault("type", "")
+    r.setdefault("matl", "")
+    r.setdefault("finish", "")
+    r.setdefault("notes", "")
     r.setdefault("sqft", 0)
     r.setdefault("perim", 0)
     r.setdefault("caulk_passes", "")
@@ -633,6 +654,67 @@ def row_has_any_input(r: dict) -> bool:
         str(r.get(k, "")).strip()
         for k in ("spec_mark", "qty", "width", "height")
     )
+
+def row_is_fully_empty(r: dict) -> bool:
+    return not any(
+        str(r.get(k, "")).strip()
+        for k in ("spec_mark", "qty", "width", "height", "head", "jamb", "sill", "type", "matl", "finish", "notes")
+    )
+
+def ensure_single_trailing_empty_row(rows: list[dict]) -> list[dict]:
+    cleaned = []
+    for row in rows:
+        normalize_fs_row(row)
+        cleaned.append(row)
+    while len(cleaned) > 1 and row_is_fully_empty(cleaned[-1]) and row_is_fully_empty(cleaned[-2]):
+        cleaned.pop(-1)
+    if not cleaned:
+        cleaned.append(blank_frame_schedule_row())
+    return cleaned
+
+def material_is_manual(material: dict) -> bool:
+    return (material.get("basis") or "").strip() == "manual"
+
+
+def material_has_any_input(material: dict) -> bool:
+    return any(
+        str(material.get(k, "")).strip()
+        for k in ("label", "factor", "rate", "qty", "unit")
+    )
+
+
+def blank_manual_material_row() -> dict:
+    return {
+        "key": "",
+        "label": "",
+        "basis": "manual",
+        "factor": "",
+        "rate": "",
+        "qty": "",
+        "unit": "",
+    }
+
+
+def ensure_single_trailing_manual_material_row(materials: list[dict]) -> list[dict]:
+    cleaned = []
+    for mat in materials:
+        if not isinstance(mat, dict):
+            continue
+        mat.setdefault("key", "")
+        mat.setdefault("basis", "manual")
+        mat.setdefault("label", "")
+        mat.setdefault("factor", "")
+        mat.setdefault("rate", "")
+        mat.setdefault("qty", "")
+        mat.setdefault("unit", "")
+        cleaned.append(mat)
+    while len(cleaned) > 1 and material_is_manual(cleaned[-1]) and material_is_manual(cleaned[-2]) and not material_has_any_input(cleaned[-1]) and not material_has_any_input(cleaned[-2]):
+        cleaned.pop(-1)
+    if not cleaned or not material_is_manual(cleaned[-1]):
+        cleaned.append(blank_manual_material_row())
+    elif material_has_any_input(cleaned[-1]):
+        cleaned.append(blank_manual_material_row())
+    return cleaned
 
 def recalc_row_fields(r: dict) -> None:
     qty = safe_int(r.get("qty"))
@@ -955,6 +1037,13 @@ def export_frame_schedule_pdf(job: dict):
                         str(safe_int(r.get("qty", "")) if str(r.get("qty","")).strip() else ""),
                         str(safe_float(r.get("width", "")) if str(r.get("width","")).strip() else ""),
                         str(safe_float(r.get("height", "")) if str(r.get("height","")).strip() else ""),
+                        r.get("head", ""),
+                        r.get("jamb", ""),
+                        r.get("sill", ""),
+                        r.get("type", ""),
+                        r.get("matl", ""),
+                        r.get("finish", ""),
+                        r.get("notes", ""),
                         str(safe_int(r.get("sqft", 0))),
                         str(safe_int(r.get("perim", 0))),
                         str(r.get("caulk_passes", "")),
@@ -972,7 +1061,7 @@ def export_frame_schedule_pdf(job: dict):
                         subtotal_row.append("")
                 table_data.append(subtotal_row)
 
-                t = Table(table_data, repeatRows=1, colWidths=[90, 32, 42, 42, 38, 38, 45, 45, 45])
+                t = Table(table_data, repeatRows=1)
                 t.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#666666")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -985,20 +1074,20 @@ def export_frame_schedule_pdf(job: dict):
                 story.append(t)
                 story.append(Spacer(1, 6))
 
-                m_headers = ["Material", "Basis", "Factor", "Rate", "Qty", "Cost"]
+                m_headers = ["Material", "Factor", "Rate", "Qty", "Cost", "Unit"]
                 m_data = [m_headers]
                 for m in sec.get("_material_rows", []):
                     m_data.append([
                         m.get("label", ""),
-                        m.get("basis", ""),
                         str(m.get("factor", "")),
                         str(m.get("rate", "")),
                         f"{safe_float(m.get('qty_calc',0)):.2f}",
                         money_fmt(m.get("cost_calc", 0)),
+                        m.get("unit", ""),
                     ])
-                m_data.append(["", "", "", "", "Install Total", money_fmt(sec.get("_install_total", 0))])
+                m_data.append(["", "", "", "Install Total", money_fmt(sec.get("_install_total", 0)), ""])
 
-                mt = Table(m_data, repeatRows=1, colWidths=[170, 120, 55, 55, 60, 60])
+                mt = Table(m_data, repeatRows=1, colWidths=[210, 55, 55, 60, 70, 90])
                 mt.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#3b6ea5")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -2026,8 +2115,6 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             for c, (h, key, w, kind) in enumerate(FS_HEADERS):
                 ttk.Label(self.grid, text=h).grid(row=0, column=c, padx=3, sticky="w")
 
-            ttk.Button(self.outer, text="+ Add Row", command=self.add_row).pack(anchor="w", padx=6, pady=(0, 6))
-
             # Build rows
             for r in self.section["rows"]:
                 self._add_row_widgets(r)
@@ -2045,7 +2132,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             self.mat_grid = ttk.Frame(self.outer)
             self.mat_grid.pack(fill="x", padx=6, pady=(4, 6))
 
-            mh = ["Material", "Basis", "Factor", "Rate", "Qty", "Cost", "Unit"]
+            mh = ["Material", "Factor", "Rate", "Qty", "Cost", "Unit"]
             for c, h in enumerate(mh):
                 ttk.Label(self.mat_grid, text=h).grid(row=0, column=c, padx=3, sticky="w")
 
@@ -2085,11 +2172,22 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 save_job(job)
                 mark_frame_dirty()
 
+        def _trim_empty_rows(self):
+            rows = ensure_single_trailing_empty_row(self.section.get("rows", []))
+            self.section["rows"] = rows
+
         def _row_commit(self, rdata: dict, fields: dict, persist: bool = True):
             rdata["spec_mark"] = fields["spec_mark"].get().strip()
             rdata["qty"] = fields["qty"].get().strip()
             rdata["width"] = fields["width"].get().strip()
             rdata["height"] = fields["height"].get().strip()
+            rdata["head"] = fields["head"].get().strip()
+            rdata["jamb"] = fields["jamb"].get().strip()
+            rdata["sill"] = fields["sill"].get().strip()
+            rdata["type"] = fields["type"].get().strip()
+            rdata["matl"] = fields["matl"].get().strip()
+            rdata["finish"] = fields["finish"].get().strip()
+            rdata["notes"] = fields["notes"].get().strip()
             recalc_row_fields(rdata)
             fields["sqft_var"].set(str(safe_int(rdata["sqft"])))
             fields["perim_var"].set(str(safe_int(rdata["perim"])))
@@ -2097,9 +2195,10 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             fields["caulk_var"].set(str(safe_int(rdata["caulk_lf"])))
             fields["hs_var"].set(str(safe_int(rdata["head_sill"])))
 
-            qty_text = str(rdata.get("qty", "")).strip()
-            if qty_text and self._is_last_row(rdata):
+            if not row_is_fully_empty(rdata) and self._is_last_row(rdata):
                 self._append_blank_row(persist=False)
+            self._trim_empty_rows()
+            self.rebuild_rows()
 
             if persist:
                 save_job(job)
@@ -2127,13 +2226,13 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 "head_sill": tk.StringVar(value="0"),
             }
             ttk.Label(self.grid, textvariable=self.sub_vars["qty"], font=("Segoe UI", 9, "bold")).grid(row=r, column=1, padx=3, sticky="e")
-            ttk.Label(self.grid, text="").grid(row=r, column=2, padx=3, sticky="e")
-            ttk.Label(self.grid, text="").grid(row=r, column=3, padx=3, sticky="e")
-            ttk.Label(self.grid, textvariable=self.sub_vars["sqft"], font=("Segoe UI", 9, "bold")).grid(row=r, column=4, padx=3, sticky="e")
-            ttk.Label(self.grid, textvariable=self.sub_vars["perim"], font=("Segoe UI", 9, "bold")).grid(row=r, column=5, padx=3, sticky="e")
-            ttk.Label(self.grid, text="", font=("Segoe UI", 9, "bold")).grid(row=r, column=6, padx=3, sticky="e")
-            ttk.Label(self.grid, textvariable=self.sub_vars["caulk_lf"], font=("Segoe UI", 9, "bold")).grid(row=r, column=7, padx=3, sticky="e")
-            ttk.Label(self.grid, textvariable=self.sub_vars["head_sill"], font=("Segoe UI", 9, "bold")).grid(row=r, column=8, padx=3, sticky="e")
+            for c in range(2, 11):
+                ttk.Label(self.grid, text="").grid(row=r, column=c, padx=3, sticky="e")
+            ttk.Label(self.grid, textvariable=self.sub_vars["sqft"], font=("Segoe UI", 9, "bold")).grid(row=r, column=11, padx=3, sticky="e")
+            ttk.Label(self.grid, textvariable=self.sub_vars["perim"], font=("Segoe UI", 9, "bold")).grid(row=r, column=12, padx=3, sticky="e")
+            ttk.Label(self.grid, text="", font=("Segoe UI", 9, "bold")).grid(row=r, column=13, padx=3, sticky="e")
+            ttk.Label(self.grid, textvariable=self.sub_vars["caulk_lf"], font=("Segoe UI", 9, "bold")).grid(row=r, column=14, padx=3, sticky="e")
+            ttk.Label(self.grid, textvariable=self.sub_vars["head_sill"], font=("Segoe UI", 9, "bold")).grid(row=r, column=15, padx=3, sticky="e")
 
         def _add_row_widgets(self, rdata: dict):
             normalize_fs_row(rdata)
@@ -2146,11 +2245,25 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             qty = ttk.Entry(self.grid, width=8)
             width = ttk.Entry(self.grid, width=8)
             height = ttk.Entry(self.grid, width=8)
+            head = ttk.Entry(self.grid, width=8)
+            jamb = ttk.Entry(self.grid, width=8)
+            sill = ttk.Entry(self.grid, width=8)
+            type_val = ttk.Entry(self.grid, width=10)
+            matl = ttk.Entry(self.grid, width=10)
+            finish = ttk.Entry(self.grid, width=10)
+            notes = ttk.Entry(self.grid, width=14)
 
             spec_mark.insert(0, rdata.get("spec_mark", ""))
             qty.insert(0, rdata.get("qty", ""))
             width.insert(0, rdata.get("width", ""))
             height.insert(0, rdata.get("height", ""))
+            head.insert(0, rdata.get("head", ""))
+            jamb.insert(0, rdata.get("jamb", ""))
+            sill.insert(0, rdata.get("sill", ""))
+            type_val.insert(0, rdata.get("type", ""))
+            matl.insert(0, rdata.get("matl", ""))
+            finish.insert(0, rdata.get("finish", ""))
+            notes.insert(0, rdata.get("notes", ""))
 
             sqft_var = tk.StringVar(value=str(safe_int(rdata.get("sqft", 0))))
             perim_var = tk.StringVar(value=str(safe_int(rdata.get("perim", 0))))
@@ -2162,20 +2275,34 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             qty.grid(row=rowi, column=1, padx=3, pady=2, sticky="w")
             width.grid(row=rowi, column=2, padx=3, pady=2, sticky="w")
             height.grid(row=rowi, column=3, padx=3, pady=2, sticky="w")
-            ttk.Label(self.grid, textvariable=sqft_var, width=8, anchor="e").grid(row=rowi, column=4, padx=3, pady=2, sticky="e")
-            ttk.Label(self.grid, textvariable=perim_var, width=8, anchor="e").grid(row=rowi, column=5, padx=3, pady=2, sticky="e")
-            ttk.Label(self.grid, textvariable=caulk_passes_var, width=10, anchor="e").grid(row=rowi, column=6, padx=3, pady=2, sticky="e")
-            ttk.Label(self.grid, textvariable=caulk_var, width=10, anchor="e").grid(row=rowi, column=7, padx=3, pady=2, sticky="e")
-            ttk.Label(self.grid, textvariable=hs_var, width=10, anchor="e").grid(row=rowi, column=8, padx=3, pady=2, sticky="e")
+            head.grid(row=rowi, column=4, padx=3, pady=2, sticky="w")
+            jamb.grid(row=rowi, column=5, padx=3, pady=2, sticky="w")
+            sill.grid(row=rowi, column=6, padx=3, pady=2, sticky="w")
+            type_val.grid(row=rowi, column=7, padx=3, pady=2, sticky="w")
+            matl.grid(row=rowi, column=8, padx=3, pady=2, sticky="w")
+            finish.grid(row=rowi, column=9, padx=3, pady=2, sticky="w")
+            notes.grid(row=rowi, column=10, padx=3, pady=2, sticky="w")
+            ttk.Label(self.grid, textvariable=sqft_var, width=8, anchor="e").grid(row=rowi, column=11, padx=3, pady=2, sticky="e")
+            ttk.Label(self.grid, textvariable=perim_var, width=8, anchor="e").grid(row=rowi, column=12, padx=3, pady=2, sticky="e")
+            ttk.Label(self.grid, textvariable=caulk_passes_var, width=10, anchor="e").grid(row=rowi, column=13, padx=3, pady=2, sticky="e")
+            ttk.Label(self.grid, textvariable=caulk_var, width=10, anchor="e").grid(row=rowi, column=14, padx=3, pady=2, sticky="e")
+            ttk.Label(self.grid, textvariable=hs_var, width=10, anchor="e").grid(row=rowi, column=15, padx=3, pady=2, sticky="e")
 
             del_btn = ttk.Button(self.grid, text="×", width=2)
-            del_btn.grid(row=rowi, column=9, padx=2, pady=2)
+            del_btn.grid(row=rowi, column=16, padx=2, pady=2)
 
             fields = {
                 "spec_mark": spec_mark,
                 "qty": qty,
                 "width": width,
                 "height": height,
+                "head": head,
+                "jamb": jamb,
+                "sill": sill,
+                "type": type_val,
+                "matl": matl,
+                "finish": finish,
+                "notes": notes,
                 "sqft_var": sqft_var,
                 "perim_var": perim_var,
                 "caulk_passes_var": caulk_passes_var,
@@ -2191,7 +2318,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             def commit_live(_=None):
                 self._row_commit(rdata, fields, persist=False)
 
-            for w in (spec_mark, qty, width, height):
+            for w in (spec_mark, qty, width, height, head, jamb, sill, type_val, matl, finish, notes):
                 w.bind("<FocusOut>", commit)
                 w.bind("<Return>", commit)
             for w in (qty, width, height):
@@ -2203,7 +2330,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 remaining = [x for x in rows if x is not rdata]
                 if not remaining:
                     remaining = [blank_frame_schedule_row()]
-                self.section["rows"] = remaining
+                self.section["rows"] = ensure_single_trailing_empty_row(remaining)
                 save_job(job)
                 self.rebuild_rows()
                 self.update_subtotals_and_materials()
@@ -2216,7 +2343,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
         def rebuild_rows(self):
             # wipe existing row widgets
             for rw in self.row_widgets:
-                for k in ("spec_mark", "qty", "width", "height", "del_btn"):
+                for k in ("spec_mark", "qty", "width", "height", "head", "jamb", "sill", "type", "matl", "finish", "notes", "del_btn"):
                     w = rw.get(k)
                     if w:
                         w.destroy()
@@ -2231,35 +2358,41 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 self._add_row_widgets(r)
             self._render_subtotal_row()
 
-        def add_row(self):
-            snapshot()
-            r = blank_frame_schedule_row()
-            self.section["rows"] = list(self.section.get("rows", [])) + [r]
-            save_job(job)
-            self._add_row_widgets(r)
-            self.update_subtotals_and_materials()
-            mark_frame_dirty()
+        def _normalize_material_rows(self):
+            mats = [m for m in self.section.get("materials", []) if isinstance(m, dict)]
+            normalized = []
+            for m in mats:
+                mm = dict(m)
+                mm.setdefault("key", "")
+                mm.setdefault("label", "")
+                mm.setdefault("basis", "manual")
+                mm.setdefault("factor", "")
+                mm.setdefault("rate", "")
+                mm.setdefault("qty", "")
+                mm.setdefault("unit", "")
+                key = mm.get("key", "")
+                if key in MATERIAL_BASIS_BY_KEY:
+                    mm["basis"] = MATERIAL_BASIS_BY_KEY[key]
+                normalized.append(mm)
+            self.section["materials"] = ensure_single_trailing_manual_material_row(normalized)
 
         def _build_material_rows(self):
-            # remove old
-            for row in self.material_widgets:
-                for w in row.values():
-                    if hasattr(w, "destroy"):
-                        w.destroy()
+            for w in list(self.mat_grid.grid_slaves()):
+                if int(w.grid_info().get("row", 0)) > 0:
+                    w.destroy()
             self.material_widgets.clear()
 
+            self._normalize_material_rows()
             mats = self.section.get("materials", [])
             for i, m in enumerate(mats, start=1):
+                key = m.get("key", "")
+                is_locked_name = bool(key) and key in list(MATERIAL_BASIS_BY_KEY.keys())[:5]
+                is_manual = material_is_manual(m)
+
                 label = ttk.Entry(self.mat_grid, width=34)
                 label.insert(0, m.get("label", ""))
-
-                basis = ttk.Combobox(self.mat_grid, state="readonly", width=20,
-                                     values=["perim_subtotal", "head_sill_subtotal", "caulk_lf_subtotal", "manual"])
-                enforced_basis = MATERIAL_BASIS_BY_KEY.get(m.get("key", ""), m.get("basis", "perim_subtotal"))
-                m["basis"] = enforced_basis
-                basis.set(enforced_basis)
-                if m.get("key", "") in MATERIAL_BASIS_BY_KEY:
-                    basis.configure(state="disabled")
+                if is_locked_name:
+                    label.configure(state="disabled")
 
                 factor = ttk.Entry(self.mat_grid, width=8)
                 factor.insert(0, m.get("factor", "1.0"))
@@ -2268,59 +2401,80 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 rate.insert(0, m.get("rate", "0"))
 
                 qty_var = tk.StringVar(value="0.00")
+                qty_widget = None
+                if is_manual:
+                    qty_widget = ttk.Entry(self.mat_grid, width=10)
+                    qty_widget.insert(0, m.get("qty", ""))
+                else:
+                    qty_widget = ttk.Label(self.mat_grid, textvariable=qty_var, width=10, anchor="e")
+                    ToolTip(qty_widget, lambda mm=m: MATERIAL_BASIS_TOOLTIPS.get(mm.get("basis", "").strip(), ""))
+
                 cost_var = tk.StringVar(value="$0")
 
                 unit = ttk.Entry(self.mat_grid, width=12)
                 unit.insert(0, m.get("unit", ""))
+                if not is_manual:
+                    unit.configure(state="disabled")
 
                 label.grid(row=i, column=0, padx=3, pady=2, sticky="w")
-                basis.grid(row=i, column=1, padx=3, pady=2, sticky="w")
-                factor.grid(row=i, column=2, padx=3, pady=2, sticky="w")
-                rate.grid(row=i, column=3, padx=3, pady=2, sticky="w")
-                qty_lbl = ttk.Label(self.mat_grid, textvariable=qty_var, width=10, anchor="e")
-                qty_lbl.grid(row=i, column=4, padx=3, pady=2, sticky="e")
-                ttk.Label(self.mat_grid, textvariable=cost_var, width=10, anchor="e").grid(row=i, column=5, padx=3, pady=2, sticky="e")
-                if m.get("basis") != "manual":
-                    ToolTip(qty_lbl, lambda rw=basis: MATERIAL_BASIS_TOOLTIPS.get(rw.get().strip(), ""))
-                unit.grid(row=i, column=6, padx=3, pady=2, sticky="w")
+                factor.grid(row=i, column=1, padx=3, pady=2, sticky="w")
+                rate.grid(row=i, column=2, padx=3, pady=2, sticky="w")
+                qty_widget.grid(row=i, column=3, padx=3, pady=2, sticky="e")
+                ttk.Label(self.mat_grid, textvariable=cost_var, width=10, anchor="e").grid(row=i, column=4, padx=3, pady=2, sticky="e")
+                unit.grid(row=i, column=5, padx=3, pady=2, sticky="w")
 
                 row = {
-                    "label": label, "basis": basis, "factor": factor, "rate": rate,
-                    "qty_var": qty_var, "cost_var": cost_var, "unit": unit, "mref": m
+                    "label": label,
+                    "factor": factor,
+                    "rate": rate,
+                    "qty_var": qty_var,
+                    "qty_widget": qty_widget,
+                    "cost_var": cost_var,
+                    "unit": unit,
+                    "mref": m,
+                    "is_manual": is_manual,
+                    "is_locked_name": is_locked_name,
                 }
                 self.material_widgets.append(row)
 
                 def commit_factory(rw=row):
                     def commit(_=None):
                         mref = rw["mref"]
-                        mref["label"] = rw["label"].get().strip()
-                        mref["basis"] = rw["basis"].get().strip()
+                        if not rw["is_locked_name"]:
+                            mref["label"] = rw["label"].get().strip()
                         mref["factor"] = rw["factor"].get().strip()
                         mref["rate"] = rw["rate"].get().strip()
-                        mref["unit"] = rw["unit"].get().strip()
-                        # keep qty only for manual basis
-                        if mref.get("basis") == "manual":
-                            # ask optional manual qty if empty remains as-is
-                            pass
+                        if rw["is_manual"]:
+                            mref["qty"] = rw["qty_widget"].get().strip()
+                            mref["unit"] = rw["unit"].get().strip()
+                        self._normalize_material_rows()
+                        self._build_material_rows()
                         save_job(job)
                         self.update_subtotals_and_materials()
                         mark_frame_dirty()
                     return commit
 
                 c = commit_factory()
-                for w in (label, basis, factor, rate, unit):
+                bind_widgets = [factor, rate]
+                if not is_locked_name:
+                    bind_widgets.append(label)
+                if is_manual:
+                    bind_widgets.extend([qty_widget, unit])
+                for w in bind_widgets:
                     w.bind("<FocusOut>", c)
                     w.bind("<Return>", c)
 
             self.install_total_var = tk.StringVar(value="$0")
             ttk.Label(self.mat_grid, text="Install Material Total", font=("Segoe UI", 9, "bold")).grid(
-                row=len(mats)+1, column=4, padx=3, pady=(6, 2), sticky="e"
+                row=len(mats)+1, column=3, padx=3, pady=(6, 2), sticky="e"
             )
             ttk.Label(self.mat_grid, textvariable=self.install_total_var, font=("Segoe UI", 9, "bold")).grid(
-                row=len(mats)+1, column=5, padx=3, pady=(6, 2), sticky="e"
+                row=len(mats)+1, column=4, padx=3, pady=(6, 2), sticky="e"
             )
 
         def update_subtotals_and_materials(self):
+            self.section["rows"] = ensure_single_trailing_empty_row(self.section.get("rows", []))
+            self._normalize_material_rows()
             subs = schedule_subtotals(self.section["rows"])
             self.sub_vars["qty"].set(str(subs["qty"]))
             self.sub_vars["sqft"].set(str(subs["sqft"]))
@@ -2331,12 +2485,13 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             install_total = 0
             for rw in self.material_widgets:
                 m = rw["mref"]
-                basis = rw["basis"].get().strip()
-                m["basis"] = basis
                 m["factor"] = rw["factor"].get().strip()
                 m["rate"] = rw["rate"].get().strip()
-                m["label"] = rw["label"].get().strip()
-                m["unit"] = rw["unit"].get().strip()
+                if not rw["is_locked_name"]:
+                    m["label"] = rw["label"].get().strip()
+                if rw["is_manual"]:
+                    m["qty"] = rw["qty_widget"].get().strip()
+                    m["unit"] = rw["unit"].get().strip()
 
                 qty = material_qty_for_row(m, subs)
                 rate = safe_float(m.get("rate"))
@@ -2435,19 +2590,30 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
 
         if not cur_sid:
             set_frame_schedule_error("Please add and select a valid cost code before adding a section.")
+        else:
+            set_frame_schedule_error("")
+
+        if not opts:
             ttk.Label(sections_wrap, text="No cost codes available. Add cost codes first.").pack(anchor="w", pady=8)
             return
 
-        set_frame_schedule_error("")
-
-        sections = job["frame_schedules"].setdefault(cur_sid, [])
-        if not sections:
-            ttk.Label(sections_wrap, text="No sections yet. Click '+ Add Section'.").pack(anchor="w", pady=8)
-        else:
+        has_any_sections = False
+        label_by_id = {sid: lbl for sid, lbl in opts}
+        for sid in ids:
+            sections = job["frame_schedules"].setdefault(sid, [])
+            spec_wrap = ttk.LabelFrame(sections_wrap, text=label_by_id.get(sid, sid))
+            spec_wrap.pack(fill="x", pady=6)
+            if not sections:
+                ttk.Label(spec_wrap, text="No sections yet for this spec.").pack(anchor="w", padx=6, pady=6)
+                continue
+            has_any_sections = True
             for sec in sections:
                 normalize_section(sec, job)
-                ui = SectionUI(sections_wrap, sec, cur_sid)
+                ui = SectionUI(spec_wrap, sec, sid)
                 section_uis.append(ui)
+
+        if not has_any_sections:
+            ttk.Label(sections_wrap, text="No sections yet. Use '+ Add Section' to add one for the selected spec.").pack(anchor="w", pady=6)
 
     def on_spec_combo_selected(_=None):
         selected_label = spec_combo.get().strip()
@@ -2461,7 +2627,6 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             current_spec_id_var.set(sid)
             selected_spec_label_var.set(selected_label)
             update_add_section_button_state(sid)
-            refresh_frame_schedule_ui()
         else:
             current_spec_id_var.set("")
             set_frame_schedule_error("Please select a valid cost code before adding a section.")
