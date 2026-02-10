@@ -472,8 +472,18 @@ def normalize_frame_schedules(job: dict) -> None:
         if not isinstance(sections, list):
             sections = []
             job["frame_schedules"][spec_id] = sections
+
+        seen_section_ids = set()
+        deduped_sections = []
         for section in sections:
             normalize_section(section, job)
+            section_id = (section.get("id") or "").strip()
+            while section_id in seen_section_ids:
+                section_id = str(uuid.uuid4())
+                section["id"] = section_id
+            seen_section_ids.add(section_id)
+            deduped_sections.append(section)
+        job["frame_schedules"][spec_id] = deduped_sections
 
     for spec_id in list(job["frame_schedules"].keys()):
         if spec_id not in valid_specs:
@@ -935,6 +945,8 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
     frame_initialized = False
     frame_dirty = True
     current_spec_id_var = tk.StringVar(value="")
+    selected_spec_label_var = tk.StringVar(value="")
+    frame_schedule_error_var = tk.StringVar(value="")
     sections_container_ref = {"frame": None}
     section_uis = []
 
@@ -1861,10 +1873,12 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
     selector_frame.pack(anchor="w", pady=6, fill="x")
 
     ttk.Label(selector_frame, text="Select Spec:").pack(side="left")
-    spec_combo = ttk.Combobox(selector_frame, state="readonly", width=40, textvariable=current_spec_id_var)
+    spec_combo = ttk.Combobox(selector_frame, state="readonly", width=40, textvariable=selected_spec_label_var)
     spec_combo.pack(side="left", padx=8)
     ttk.Button(selector_frame, text="+ Add Section", command=lambda: add_section_ui()).pack(side="left", padx=4)
     ttk.Button(selector_frame, text="Export PDF", command=lambda: export_frame_schedule_pdf(job)).pack(side="left", padx=4)
+    frame_schedule_error = ttk.Label(selector_frame, textvariable=frame_schedule_error_var, foreground="#b00020")
+    frame_schedule_error.pack(side="left", padx=8)
 
     sections_wrap = ttk.Frame(fs_scroll.inner)
     sections_wrap.pack(fill="both", expand=True)
@@ -1938,8 +1952,10 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             if not messagebox.askyesno("Delete Section", "Delete this section?"):
                 return
             snapshot()
-            sections = job["frame_schedules"].get(self.spec_id, [])
-            sections[:] = [s for s in sections if s.get("id") != self.section.get("id")]
+            sections = list(job["frame_schedules"].get(self.spec_id, []))
+            job["frame_schedules"][self.spec_id] = [
+                s for s in sections if s.get("id") != self.section.get("id")
+            ]
             save_job(job)
             refresh_frame_schedule_ui()
             mark_frame_dirty()
@@ -2195,6 +2211,29 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 opts.append((sid, lbl))
         return opts
 
+    def set_frame_schedule_error(message: str):
+        frame_schedule_error_var.set(message)
+
+    def resolve_current_spec_id(opts=None):
+        options = opts if opts is not None else frame_spec_options()
+        if not options:
+            return ""
+
+        id_to_label = {sid: lbl for sid, lbl in options}
+        label_to_id = {lbl: sid for sid, lbl in options}
+
+        current_id = current_spec_id_var.get().strip()
+        if current_id in id_to_label:
+            return current_id
+
+        selected_label = selected_spec_label_var.get().strip() or spec_combo.get().strip()
+        if selected_label in label_to_id:
+            resolved_id = label_to_id[selected_label]
+            current_spec_id_var.set(resolved_id)
+            return resolved_id
+
+        return ""
+
     def ensure_frame_initialized():
         nonlocal frame_initialized
         if frame_initialized:
@@ -2205,6 +2244,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
     def refresh_frame_schedule_ui():
         normalize_frame_schedules(job)
         compute_frame_schedule_rollups(job)
+        set_frame_schedule_error("")
 
         for w in sections_wrap.winfo_children():
             w.destroy()
@@ -2216,7 +2256,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
         spec_combo["values"] = labels
 
         # current selection
-        cur_sid = current_spec_id_var.get().strip()
+        cur_sid = resolve_current_spec_id(opts)
         if cur_sid not in ids:
             cur_sid = ids[0] if ids else ""
             current_spec_id_var.set(cur_sid)
@@ -2227,6 +2267,7 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             if sid == cur_sid:
                 display = lbl
                 break
+        selected_spec_label_var.set(display)
         spec_combo.set(display)
 
         if not cur_sid:
@@ -2250,18 +2291,25 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
                 sid = _sid
                 break
         if sid:
+            set_frame_schedule_error("")
             current_spec_id_var.set(sid)
+            selected_spec_label_var.set(selected_label)
             refresh_frame_schedule_ui()
+        else:
+            current_spec_id_var.set("")
+            set_frame_schedule_error("Please select a valid cost code before adding a section.")
 
     spec_combo.bind("<<ComboboxSelected>>", on_spec_combo_selected)
 
     def add_section_ui():
-        sid = current_spec_id_var.get().strip()
+        sid = resolve_current_spec_id()
         if not sid:
-            messagebox.showwarning("No Spec", "Select a spec first.")
+            set_frame_schedule_error("Please select a valid cost code before adding a section.")
+            messagebox.showerror("Invalid Cost Code", "Select a valid cost code before adding a section.")
             return
+        set_frame_schedule_error("")
         snapshot()
-        sections = job["frame_schedules"].setdefault(sid, [])
+        sections = list(job["frame_schedules"].get(sid, []))
         sec = {
             "id": str(uuid.uuid4()),
             "name": f"Section {len(sections)+1}",
@@ -2269,7 +2317,8 @@ def open_job_tab(root, notebook, job: dict, refresh_main, close_tab, config_mana
             "materials": copy.deepcopy(job.get("config", {}).get("materials", default_config()["materials"])),
         }
         normalize_section(sec, job)
-        sections.append(sec)
+        sections = sections + [sec]
+        job["frame_schedules"][sid] = sections
         save_job(job)
         refresh_frame_schedule_ui()
         mark_frame_dirty()
